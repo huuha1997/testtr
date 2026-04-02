@@ -2,6 +2,7 @@ FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.toml
+COPY apps/console apps/console
 COPY crates crates
 COPY services/mcp-gateway services/mcp-gateway
 COPY services/orchestrator services/orchestrator

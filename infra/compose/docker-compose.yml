@@ -48,16 +48,16 @@ services:
       HTTP_ADDR: 0.0.0.0:8080
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/agentic
       REDIS_URL: redis://redis:6379
-      RUST_LOG: info
-      SSE_HEARTBEAT_SECONDS: 5
-      ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef
-      OAUTH_BANANA_CLIENT_ID: banana-client-id
-      OAUTH_BANANA_CLIENT_SECRET: banana-client-secret
-      OAUTH_BANANA_AUTH_URL: https://example.com/oauth/authorize
-      OAUTH_BANANA_TOKEN_URL: https://example.com/oauth/token
-      OAUTH_BANANA_REVOKE_URL: https://example.com/oauth/revoke
-      OAUTH_BANANA_REDIRECT_URL: http://localhost:8080/api/connections/banana/oauth/callback
-      OAUTH_BANANA_SCOPES: design.generate
+      RUST_LOG: ${RUST_LOG:-info}
+      SSE_HEARTBEAT_SECONDS: ${SSE_HEARTBEAT_SECONDS:-5}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef}
+      OAUTH_BANANA_CLIENT_ID: ${OAUTH_BANANA_CLIENT_ID:-banana-client-id}
+      OAUTH_BANANA_CLIENT_SECRET: ${OAUTH_BANANA_CLIENT_SECRET:-banana-client-secret}
+      OAUTH_BANANA_AUTH_URL: ${OAUTH_BANANA_AUTH_URL:-https://example.com/oauth/authorize}
+      OAUTH_BANANA_TOKEN_URL: ${OAUTH_BANANA_TOKEN_URL:-https://example.com/oauth/token}
+      OAUTH_BANANA_REVOKE_URL: ${OAUTH_BANANA_REVOKE_URL:-https://example.com/oauth/revoke}
+      OAUTH_BANANA_REDIRECT_URL: ${OAUTH_BANANA_REDIRECT_URL:-http://localhost:8080/api/connections/banana/oauth/callback}
+      OAUTH_BANANA_SCOPES: ${OAUTH_BANANA_SCOPES:-design.generate}
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,18 +72,31 @@ services:
       dockerfile: services/mcp-gateway/Dockerfile
     environment:
       HTTP_ADDR: 0.0.0.0:8090
-      RUST_LOG: info
-      MCP_INTERNAL_API_KEY: local-internal-key
-      MCP_PROVIDER_HTTP_TIMEOUT_SECONDS: 25
-      MCP_PROVIDER_MAX_RETRIES: 3
-      BANANA_API_URL: https://example.com/banana/generate
-      BANANA_API_TOKEN: banana-token
-      STITCH_API_URL: https://example.com/stitch/extract
-      STITCH_API_TOKEN: stitch-token
-      CLAUDE_API_URL: https://example.com/claude/codegen
-      CLAUDE_API_TOKEN: claude-token
-      GITHUB_API_TOKEN: ""
-      GITHUB_API_BASE: https://api.github.com
+      RUST_LOG: ${RUST_LOG:-info}
+      MCP_INTERNAL_API_KEY: ${MCP_INTERNAL_API_KEY:-local-internal-key}
+      MCP_PROVIDER_HTTP_TIMEOUT_SECONDS: ${MCP_PROVIDER_HTTP_TIMEOUT_SECONDS:-25}
+      MCP_PROVIDER_MAX_RETRIES: ${MCP_PROVIDER_MAX_RETRIES:-3}
+      BANANA_API_URL: ${BANANA_API_URL:-https://example.com/banana/generate}
+      BANANA_API_TOKEN: ${BANANA_API_TOKEN:-}
+      BANANA_API_KEY_HEADER: ${BANANA_API_KEY_HEADER:-x-goog-api-key}
+      BANANA_API_EXTRA_HEADERS_JSON: ${BANANA_API_EXTRA_HEADERS_JSON:-}
+      STITCH_API_URL: ${STITCH_API_URL:-https://example.com/stitch/extract}
+      STITCH_API_TOKEN: ${STITCH_API_TOKEN:-}
+      STITCH_API_KEY_HEADER: ${STITCH_API_KEY_HEADER:-X-Goog-Api-Key}
+      STITCH_API_EXTRA_HEADERS_JSON: ${STITCH_API_EXTRA_HEADERS_JSON:-}
+      CLAUDE_API_URL: ${CLAUDE_API_URL:-https://example.com/claude/codegen}
+      CLAUDE_API_TOKEN: ${CLAUDE_API_TOKEN:-}
+      CLAUDE_API_KEY_HEADER: ${CLAUDE_API_KEY_HEADER:-x-api-key}
+      CLAUDE_API_EXTRA_HEADERS_JSON: ${CLAUDE_API_EXTRA_HEADERS_JSON:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-3-5-sonnet-latest}
+      CLAUDE_MAX_TOKENS: ${CLAUDE_MAX_TOKENS:-1024}
+      STITCH_MCP_TOOL_NAME: ${STITCH_MCP_TOOL_NAME:-extract_spec}
+      GITHUB_API_TOKEN: ${GITHUB_API_TOKEN:-}
+      GITHUB_API_BASE: ${GITHUB_API_BASE:-https://api.github.com}
+      VERCEL_API_TOKEN: ${VERCEL_API_TOKEN:-}
+      VERCEL_API_BASE: ${VERCEL_API_BASE:-https://api.vercel.com}
+      VERCEL_HTTP_TIMEOUT_SECONDS: ${VERCEL_HTTP_TIMEOUT_SECONDS:-25}
+      VERCEL_MAX_RETRIES: ${VERCEL_MAX_RETRIES:-3}
     ports:
       - "8090:8090"
 
@@ -94,11 +107,11 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/agentic
       REDIS_URL: redis://redis:6379
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
       DESIGN_CONSUMER_NAME: design-worker-local
       MCP_GATEWAY_URL: http://mcp-gateway:8090
-      MCP_HTTP_TIMEOUT_SECONDS: 20
-      MCP_INTERNAL_API_KEY: local-internal-key
+      MCP_HTTP_TIMEOUT_SECONDS: ${MCP_HTTP_TIMEOUT_SECONDS:-20}
+      MCP_INTERNAL_API_KEY: ${MCP_INTERNAL_API_KEY:-local-internal-key}
     depends_on:
       postgres:
         condition: service_healthy
@@ -114,11 +127,11 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/agentic
       REDIS_URL: redis://redis:6379
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
       SPEC_CONSUMER_NAME: spec-worker-local
       MCP_GATEWAY_URL: http://mcp-gateway:8090
-      MCP_HTTP_TIMEOUT_SECONDS: 20
-      MCP_INTERNAL_API_KEY: local-internal-key
+      MCP_HTTP_TIMEOUT_SECONDS: ${MCP_HTTP_TIMEOUT_SECONDS:-20}
+      MCP_INTERNAL_API_KEY: ${MCP_INTERNAL_API_KEY:-local-internal-key}
     depends_on:
       postgres:
         condition: service_healthy
@@ -134,11 +147,11 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/agentic
       REDIS_URL: redis://redis:6379
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
       CODEGEN_CONSUMER_NAME: codegen-worker-local
       MCP_GATEWAY_URL: http://mcp-gateway:8090
-      MCP_HTTP_TIMEOUT_SECONDS: 20
-      MCP_INTERNAL_API_KEY: local-internal-key
+      MCP_HTTP_TIMEOUT_SECONDS: ${MCP_HTTP_TIMEOUT_SECONDS:-20}
+      MCP_INTERNAL_API_KEY: ${MCP_INTERNAL_API_KEY:-local-internal-key}
     depends_on:
       postgres:
         condition: service_healthy
@@ -154,9 +167,9 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/agentic
       REDIS_URL: redis://redis:6379
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
       CI_CONSUMER_NAME: ci-worker-local
-      CI_DEPLOY_VERCEL_PROJECT_NAME: agentic-preview
+      CI_DEPLOY_VERCEL_PROJECT_NAME: ${CI_DEPLOY_VERCEL_PROJECT_NAME:-agentic-preview}
     depends_on:
       postgres:
         condition: service_healthy
@@ -170,18 +183,18 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/agentic
       REDIS_URL: redis://redis:6379
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
       DEPLOY_CONSUMER_NAME: deploy-worker-local
       MCP_GATEWAY_URL: http://mcp-gateway:8090
-      DEPLOY_HTTP_TIMEOUT_SECONDS: 20
-      MCP_INTERNAL_API_KEY: local-internal-key
-      DEPLOY_VERCEL_PROJECT_NAME: agentic-preview
-      DEPLOY_VERCEL_TEAM_ID: ""
-      DEPLOY_VERCEL_SLUG: ""
-      DEPLOY_GITHUB_OWNER: ""
-      DEPLOY_GITHUB_REPO: ""
-      DEPLOY_GITHUB_BASE_BRANCH: main
-      DEPLOY_GITHUB_HEAD_PREFIX: preview/run-
+      DEPLOY_HTTP_TIMEOUT_SECONDS: ${DEPLOY_HTTP_TIMEOUT_SECONDS:-20}
+      MCP_INTERNAL_API_KEY: ${MCP_INTERNAL_API_KEY:-local-internal-key}
+      DEPLOY_VERCEL_PROJECT_NAME: ${DEPLOY_VERCEL_PROJECT_NAME:-agentic-preview}
+      DEPLOY_VERCEL_TEAM_ID: ${DEPLOY_VERCEL_TEAM_ID:-}
+      DEPLOY_VERCEL_SLUG: ${DEPLOY_VERCEL_SLUG:-}
+      DEPLOY_GITHUB_OWNER: ${DEPLOY_GITHUB_OWNER:-}
+      DEPLOY_GITHUB_REPO: ${DEPLOY_GITHUB_REPO:-}
+      DEPLOY_GITHUB_BASE_BRANCH: ${DEPLOY_GITHUB_BASE_BRANCH:-main}
+      DEPLOY_GITHUB_HEAD_PREFIX: ${DEPLOY_GITHUB_HEAD_PREFIX:-preview/run-}
     depends_on:
       postgres:
         condition: service_healthy

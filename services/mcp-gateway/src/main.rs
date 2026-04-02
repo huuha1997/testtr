@@ -32,6 +32,11 @@ struct ProviderProxyConfig {
     name: &'static str,
     api_url: Option<String>,
     api_token: Option<String>,
+    api_key_header: Option<String>,
+    extra_headers: Vec<(String, String)>,
+    default_model: Option<String>,
+    default_max_tokens: Option<u32>,
+    mcp_tool_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -145,6 +150,16 @@ async fn main() -> anyhow::Result<()> {
             api_token: std::env::var("BANANA_API_TOKEN")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            api_key_header: Some(
+                std::env::var("BANANA_API_KEY_HEADER")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "x-goog-api-key".to_string()),
+            ),
+            extra_headers: parse_extra_headers("BANANA_API_EXTRA_HEADERS_JSON"),
+            default_model: None,
+            default_max_tokens: None,
+            mcp_tool_name: None,
         },
         stitch: ProviderProxyConfig {
             name: "stitch",
@@ -152,6 +167,18 @@ async fn main() -> anyhow::Result<()> {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             api_token: std::env::var("STITCH_API_TOKEN")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            api_key_header: Some(
+                std::env::var("STITCH_API_KEY_HEADER")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "x-api-key".to_string()),
+            ),
+            extra_headers: parse_extra_headers("STITCH_API_EXTRA_HEADERS_JSON"),
+            default_model: None,
+            default_max_tokens: None,
+            mcp_tool_name: std::env::var("STITCH_MCP_TOOL_NAME")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
         },
@@ -163,6 +190,20 @@ async fn main() -> anyhow::Result<()> {
             api_token: std::env::var("CLAUDE_API_TOKEN")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            api_key_header: Some(
+                std::env::var("CLAUDE_API_KEY_HEADER")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "x-api-key".to_string()),
+            ),
+            extra_headers: parse_extra_headers("CLAUDE_API_EXTRA_HEADERS_JSON"),
+            default_model: std::env::var("CLAUDE_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            default_max_tokens: std::env::var("CLAUDE_MAX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok()),
+            mcp_tool_name: None,
         },
         github_api_base: std::env::var("GITHUB_API_BASE")
             .unwrap_or_else(|_| "https://api.github.com".to_string()),
@@ -359,7 +400,18 @@ async fn proxy_provider_call(
     })?;
 
     let url = Url::parse(&api_url).map_err(internal_err)?;
-    let (attempt_count, raw) = call_with_retry(state, url, Some(token), None, payload).await?;
+    let payload = normalize_provider_payload(provider, &url, payload);
+    let mut extra_headers: Vec<(String, String)> = Vec::new();
+    let bearer_token = if let Some(header_name) = provider.api_key_header.as_ref() {
+        extra_headers.push((header_name.clone(), token));
+        None
+    } else {
+        Some(token)
+    };
+    extra_headers.extend(provider.extra_headers.clone());
+    let headers = if extra_headers.is_empty() { None } else { Some(extra_headers) };
+    let (attempt_count, raw) =
+        call_with_retry(state, url, bearer_token, headers, payload).await?;
     Ok(Json(ProviderProxyResponse {
         accepted: true,
         provider: provider.name.to_string(),
@@ -443,6 +495,120 @@ fn extract_payload(body: ProxyBody) -> serde_json::Value {
     }
 }
 
+fn normalize_provider_payload(
+    provider: &ProviderProxyConfig,
+    url: &Url,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    match provider.name {
+        "banana" => normalize_banana_payload(url, payload),
+        "claude" => normalize_claude_payload(provider, url, payload),
+        "stitch" => normalize_stitch_payload(provider, url, payload),
+        _ => payload,
+    }
+}
+
+fn normalize_banana_payload(url: &Url, payload: serde_json::Value) -> serde_json::Value {
+    let url_text = url.as_str().to_ascii_lowercase();
+    if !url_text.contains("generativelanguage.googleapis.com")
+        || !url_text.contains(":generatecontent")
+    {
+        return payload;
+    }
+    if payload.get("contents").is_some() {
+        return payload;
+    }
+    let prompt = extract_prompt_text(&payload)
+        .unwrap_or_else(|| serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()));
+    serde_json::json!({
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    { "text": prompt }
+                ]
+            }
+        ]
+    })
+}
+
+fn normalize_claude_payload(
+    provider: &ProviderProxyConfig,
+    url: &Url,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let url_text = url.as_str().to_ascii_lowercase();
+    if !url_text.contains("api.anthropic.com") || !url_text.contains("/v1/messages") {
+        return payload;
+    }
+    if payload.get("messages").is_some() && payload.get("model").is_some() {
+        return payload;
+    }
+    let prompt = extract_prompt_text(&payload)
+        .unwrap_or_else(|| serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()));
+    serde_json::json!({
+        "model": provider.default_model.as_deref().unwrap_or("claude-3-5-sonnet-latest"),
+        "max_tokens": provider.default_max_tokens.unwrap_or(1024),
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    })
+}
+
+fn normalize_stitch_payload(
+    provider: &ProviderProxyConfig,
+    url: &Url,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let url_text = url.as_str().to_ascii_lowercase();
+    if !url_text.ends_with("/mcp") {
+        return payload;
+    }
+    if payload.get("jsonrpc").is_some() && payload.get("method").is_some() {
+        return payload;
+    }
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "1".to_string());
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": provider.mcp_tool_name.as_deref().unwrap_or("extract_spec"),
+            "arguments": payload
+        }
+    })
+}
+
+fn extract_prompt_text(payload: &serde_json::Value) -> Option<String> {
+    if let Some(v) = payload
+        .get("input")
+        .and_then(|v| v.get("prompt"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(v.to_string());
+    }
+    if let Some(v) = payload.get("prompt").and_then(|v| v.as_str()) {
+        return Some(v.to_string());
+    }
+    if let Some(v) = payload
+        .get("input")
+        .and_then(|v| v.get("design_output"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(v.to_string());
+    }
+    payload
+        .get("design_output")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+}
+
 fn authorize_internal(
     state: &AppState,
     headers: &HeaderMap,
@@ -485,4 +651,23 @@ fn bad_gateway_err(err: impl std::fmt::Display) -> (StatusCode, Json<ErrorRespon
 
 fn backoff_duration(attempt: usize) -> Duration {
     Duration::from_millis((attempt as u64) * 300)
+}
+
+fn parse_extra_headers(var_name: &str) -> Vec<(String, String)> {
+    let raw = std::env::var(var_name).ok();
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(raw);
+    let Ok(serde_json::Value::Object(map)) = parsed else {
+        warn!(env = var_name, "invalid extra headers json, expected object");
+        return Vec::new();
+    };
+    map.into_iter()
+        .filter_map(|(k, v)| v.as_str().map(|vv| (k, vv.to_string())))
+        .collect()
 }
