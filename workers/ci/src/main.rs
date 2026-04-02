@@ -20,6 +20,7 @@ const MAX_ATTEMPTS: i32 = 3;
 const IDEMPOTENCY_LOCK_TTL_SECONDS: usize = 1800;
 const MAX_REPAIR_ITERATIONS: i64 = 2;
 const QUALITY_GATES: [&str; 6] = ["lint", "typecheck", "build", "e2e", "visual", "a11y"];
+const DEFAULT_DEPLOY_PROJECT_NAME: &str = "agentic-preview";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -249,7 +250,8 @@ async fn process_job(
             attempt: 1,
             payload_json: serde_json::json!({
                 "source": "ci_worker",
-                "repair_iteration": repair_iteration
+                "repair_iteration": repair_iteration,
+                "deployment": build_deployment_payload(job.run_id, repair_iteration)
             })
             .to_string(),
         },
@@ -257,6 +259,33 @@ async fn process_job(
     .await?;
     info!(run_id = %job.run_id, "ci job processed");
     Ok(())
+}
+
+fn build_deployment_payload(run_id: Uuid, repair_iteration: i64) -> serde_json::Value {
+    let project_name = std::env::var("CI_DEPLOY_VERCEL_PROJECT_NAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_DEPLOY_PROJECT_NAME.to_string());
+    let run_id_str = run_id.to_string();
+    let run_short = &run_id_str[..8];
+    let now = Utc::now().to_rfc3339();
+    serde_json::json!({
+        "name": format!("{}-{}", project_name, run_short),
+        "files": [
+            {
+                "file": "index.html",
+                "data": format!(
+                    "<!doctype html><html><head><meta charset=\"utf-8\"><title>Agentic Preview</title></head><body><h1>Agentic Preview</h1><p>run_id={}</p><p>repair_iteration={}</p><p>generated_at={}</p></body></html>",
+                    run_id,
+                    repair_iteration,
+                    now
+                )
+            }
+        ],
+        "projectSettings": {
+            "framework": null
+        }
+    })
 }
 
 fn parse_job(map: &HashMap<String, Value>) -> anyhow::Result<QueueJob> {

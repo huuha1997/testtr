@@ -10,6 +10,8 @@ contracts = { path = "../../crates/contracts" }
 dotenvy.workspace = true
 queue = { path = "../../crates/queue" }
 redis.workspace = true
+reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

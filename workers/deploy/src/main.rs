@@ -1,13 +1,14 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::Context;
-use chrono::Utc;
 use contracts::RunStatus;
 use queue::{QueueJob, ack, acquire_idempotency_lock, enqueue};
 use redis::{
     AsyncCommands, Value,
     streams::{StreamId, StreamReadOptions, StreamReadReply},
 };
+use serde_json::json;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -17,6 +18,53 @@ const DLQ_STREAM_KEY: &str = "q.deploy.dlq";
 const GROUP: &str = "cg.deploy";
 const MAX_ATTEMPTS: i32 = 3;
 const IDEMPOTENCY_LOCK_TTL_SECONDS: usize = 1800;
+
+#[derive(Clone)]
+struct WorkerState {
+    mcp_gateway_base_url: String,
+    mcp_gateway_http: reqwest::Client,
+    mcp_internal_api_key: Option<String>,
+    deploy_github_owner: Option<String>,
+    deploy_github_repo: Option<String>,
+    deploy_github_base_branch: String,
+    deploy_github_head_prefix: String,
+    deploy_vercel_team_id: Option<String>,
+    deploy_vercel_slug: Option<String>,
+    deploy_vercel_project_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GatewayGithubCreatePrRequest {
+    owner: String,
+    repo: String,
+    head: String,
+    base: String,
+    title: String,
+    body: String,
+    draft: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayGithubCreatePrResponse {
+    number: i64,
+    html_url: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GatewayVercelDeployRequest {
+    team_id: Option<String>,
+    slug: Option<String>,
+    deployment: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayVercelDeployResponse {
+    deployment_id: String,
+    ready_state: Option<String>,
+    deployment_url: Option<String>,
+    inspector_url: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,6 +79,55 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let consumer_name = std::env::var("DEPLOY_CONSUMER_NAME")
         .unwrap_or_else(|_| format!("deploy-worker-{}", Uuid::new_v4()));
+    let mcp_gateway_base_url = std::env::var("MCP_GATEWAY_URL")
+        .unwrap_or_else(|_| "http://localhost:8090".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let deploy_http_timeout_seconds: u64 = std::env::var("DEPLOY_HTTP_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let deploy_vercel_team_id = std::env::var("DEPLOY_VERCEL_TEAM_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let deploy_vercel_slug = std::env::var("DEPLOY_VERCEL_SLUG")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let deploy_vercel_project_name = std::env::var("DEPLOY_VERCEL_PROJECT_NAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "agentic-preview".to_string());
+    let deploy_github_owner = std::env::var("DEPLOY_GITHUB_OWNER")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let deploy_github_repo = std::env::var("DEPLOY_GITHUB_REPO")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let deploy_github_base_branch = std::env::var("DEPLOY_GITHUB_BASE_BRANCH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "main".to_string());
+    let deploy_github_head_prefix = std::env::var("DEPLOY_GITHUB_HEAD_PREFIX")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "preview/run-".to_string());
+
+    let state = WorkerState {
+        mcp_gateway_base_url,
+        mcp_gateway_http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(deploy_http_timeout_seconds))
+            .build()?,
+        mcp_internal_api_key: std::env::var("MCP_INTERNAL_API_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        deploy_github_owner,
+        deploy_github_repo,
+        deploy_github_base_branch,
+        deploy_github_head_prefix,
+        deploy_vercel_team_id,
+        deploy_vercel_slug,
+        deploy_vercel_project_name,
+    };
 
     let db = PgPool::connect(&database_url).await?;
     let redis = redis::Client::open(redis_url)?;
@@ -55,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
         };
         for key in reply.keys {
             for id in key.ids {
-                if let Err(err) = handle_message(&db, &mut conn, id).await {
+                if let Err(err) = handle_message(&db, &state, &mut conn, id).await {
                     error!(error = %err, "message handling failed");
                 }
             }
@@ -83,6 +180,7 @@ async fn ensure_group(conn: &mut redis::aio::MultiplexedConnection) -> anyhow::R
 
 async fn handle_message(
     db: &PgPool,
+    state: &WorkerState,
     conn: &mut redis::aio::MultiplexedConnection,
     id: StreamId,
 ) -> anyhow::Result<()> {
@@ -95,7 +193,7 @@ async fn handle_message(
         ack(conn, STREAM_KEY, GROUP, &id.id).await?;
         return Ok(());
     }
-    match process_job(db, &job).await {
+    match process_job(db, state, &job).await {
         Ok(()) => {
             ack(conn, STREAM_KEY, GROUP, &id.id).await?;
         }
@@ -129,23 +227,30 @@ async fn handle_message(
     Ok(())
 }
 
-async fn process_job(db: &PgPool, job: &QueueJob) -> anyhow::Result<()> {
+async fn process_job(db: &PgPool, state: &WorkerState, job: &QueueJob) -> anyhow::Result<()> {
     if job.payload_json.contains("\"force_fail\":true") {
         return Err(anyhow::anyhow!("forced failure"));
     }
+
     sqlx::query("UPDATE runs SET status = $2 WHERE id = $1")
         .bind(job.run_id)
         .bind(RunStatus::PrReady.as_str())
         .execute(db)
         .await?;
+    let payload: serde_json::Value = serde_json::from_str(&job.payload_json).unwrap_or_default();
+    let pr_result = maybe_create_pull_request(state, job.run_id, &payload).await?;
     upsert_step(
         db,
         job.run_id,
         "pr_create".to_string(),
         "completed".to_string(),
-        Some(format!("pr_ready_at={}", Utc::now().to_rfc3339())),
+        Some(pr_result),
     )
     .await?;
+
+    let gateway_request = build_gateway_deploy_request(state, job.run_id, &job.payload_json)?;
+    let deployed = trigger_vercel_preview(state, &gateway_request).await?;
+
     sqlx::query("UPDATE runs SET status = $2 WHERE id = $1")
         .bind(job.run_id)
         .bind(RunStatus::PreviewDeployed.as_str())
@@ -156,9 +261,18 @@ async fn process_job(db: &PgPool, job: &QueueJob) -> anyhow::Result<()> {
         job.run_id,
         "preview_deploy".to_string(),
         "completed".to_string(),
-        Some(format!("preview_url=http://preview.local/{}", job.run_id)),
+        Some(format!(
+            "deployment_id={},ready_state={},preview_url={},inspector_url={}",
+            deployed.deployment_id,
+            deployed.ready_state.unwrap_or_else(|| "unknown".to_string()),
+            deployed
+                .deployment_url
+                .unwrap_or_else(|| "unknown".to_string()),
+            deployed.inspector_url.unwrap_or_else(|| "unknown".to_string())
+        )),
     )
     .await?;
+
     sqlx::query("UPDATE runs SET status = $2 WHERE id = $1")
         .bind(job.run_id)
         .bind(RunStatus::AwaitingApproval.as_str())
@@ -174,6 +288,150 @@ async fn process_job(db: &PgPool, job: &QueueJob) -> anyhow::Result<()> {
     .await?;
     info!(run_id = %job.run_id, "deploy job processed");
     Ok(())
+}
+
+fn build_gateway_deploy_request(
+    state: &WorkerState,
+    run_id: Uuid,
+    payload_json: &str,
+) -> anyhow::Result<GatewayVercelDeployRequest> {
+    let payload: serde_json::Value = serde_json::from_str(payload_json).unwrap_or_default();
+    let deployment = payload
+        .get("deployment")
+        .and_then(|d| d.as_object().map(|_| d.clone()))
+        .unwrap_or_else(|| {
+            // Default static deployment so end-to-end can run before git integration is complete.
+            json!({
+                "name": format!("{}-{}", state.deploy_vercel_project_name, &run_id.to_string()[..8]),
+                "files": [
+                    {
+                        "file": "index.html",
+                        "data": format!(
+                            "<!doctype html><html><body><h1>Agentic Preview</h1><p>run_id={}</p></body></html>",
+                            run_id
+                        )
+                    }
+                ],
+                "projectSettings": {
+                    "framework": null
+                }
+            })
+        });
+
+    Ok(GatewayVercelDeployRequest {
+        team_id: state.deploy_vercel_team_id.clone(),
+        slug: state.deploy_vercel_slug.clone(),
+        deployment,
+    })
+}
+
+async fn trigger_vercel_preview(
+    state: &WorkerState,
+    payload: &GatewayVercelDeployRequest,
+) -> anyhow::Result<GatewayVercelDeployResponse> {
+    let url = format!("{}/mcp/deploy/vercel", state.mcp_gateway_base_url);
+    let mut req = state.mcp_gateway_http.post(url).json(payload);
+    if let Some(key) = state.mcp_internal_api_key.as_ref() {
+        req = req.header("x-internal-api-key", key);
+    }
+    let response = req.send().await.context("mcp-gateway request failed")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "mcp-gateway deploy failed: http {}: {}",
+            status.as_u16(),
+            body
+        ));
+    }
+
+    response
+        .json::<GatewayVercelDeployResponse>()
+        .await
+        .context("invalid mcp-gateway deploy response")
+}
+
+async fn maybe_create_pull_request(
+    state: &WorkerState,
+    run_id: Uuid,
+    payload: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let owner = payload
+        .pointer("/pr/owner")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .or_else(|| state.deploy_github_owner.clone());
+    let repo = payload
+        .pointer("/pr/repo")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .or_else(|| state.deploy_github_repo.clone());
+    let Some(owner) = owner else {
+        return Ok("skipped: DEPLOY_GITHUB_OWNER not configured".to_string());
+    };
+    let Some(repo) = repo else {
+        return Ok("skipped: DEPLOY_GITHUB_REPO not configured".to_string());
+    };
+    let run_short = &run_id.to_string()[..8];
+    let head = payload
+        .pointer("/pr/head")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| format!("{}{}", state.deploy_github_head_prefix, run_short));
+    let base = payload
+        .pointer("/pr/base")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| state.deploy_github_base_branch.clone());
+    let title = payload
+        .pointer("/pr/title")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| format!("Agentic preview for run {}", run_short));
+    let body = payload
+        .pointer("/pr/body")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| format!("Auto-generated from run {}", run_id));
+    let draft = payload
+        .pointer("/pr/draft")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let req_payload = GatewayGithubCreatePrRequest {
+        owner,
+        repo,
+        head,
+        base,
+        title,
+        body,
+        draft,
+    };
+    let url = format!("{}/mcp/repo/create-pr", state.mcp_gateway_base_url);
+    let mut req = state.mcp_gateway_http.post(url).json(&req_payload);
+    if let Some(key) = state.mcp_internal_api_key.as_ref() {
+        req = req.header("x-internal-api-key", key);
+    }
+    let response = req.send().await.context("mcp-gateway request failed")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "mcp-gateway create-pr failed: http {}: {}",
+            status.as_u16(),
+            body
+        ));
+    }
+    let out = response
+        .json::<GatewayGithubCreatePrResponse>()
+        .await
+        .context("invalid mcp-gateway create-pr response")?;
+    Ok(format!(
+        "pr_number={},pr_state={},pr_url={}",
+        out.number,
+        out.state.unwrap_or_else(|| "unknown".to_string()),
+        out.html_url.unwrap_or_else(|| "unknown".to_string())
+    ))
 }
 
 fn parse_job(map: &HashMap<String, Value>) -> anyhow::Result<QueueJob> {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::Context;
 use chrono::Utc;
@@ -8,6 +8,7 @@ use redis::{
     AsyncCommands, Value,
     streams::{StreamId, StreamReadOptions, StreamReadReply},
 };
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -18,6 +19,23 @@ const DLQ_STREAM_KEY: &str = "q.spec.dlq";
 const GROUP: &str = "cg.spec";
 const MAX_ATTEMPTS: i32 = 3;
 const IDEMPOTENCY_LOCK_TTL_SECONDS: usize = 1800;
+
+#[derive(Clone)]
+struct WorkerState {
+    mcp_gateway_base_url: String,
+    mcp_gateway_http: reqwest::Client,
+    mcp_internal_api_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GatewayRequest {
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayResponse {
+    raw: serde_json::Value,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,6 +50,24 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let consumer_name = std::env::var("SPEC_CONSUMER_NAME")
         .unwrap_or_else(|_| format!("spec-worker-{}", Uuid::new_v4()));
+    let mcp_gateway_base_url = std::env::var("MCP_GATEWAY_URL")
+        .unwrap_or_else(|_| "http://localhost:8090".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let mcp_http_timeout_seconds: u64 = std::env::var("MCP_HTTP_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+
+    let state = WorkerState {
+        mcp_gateway_base_url,
+        mcp_gateway_http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(mcp_http_timeout_seconds))
+            .build()?,
+        mcp_internal_api_key: std::env::var("MCP_INTERNAL_API_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+    };
 
     let db = PgPool::connect(&database_url).await?;
     let redis = redis::Client::open(redis_url)?;
@@ -56,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         };
         for key in reply.keys {
             for id in key.ids {
-                if let Err(err) = handle_message(&db, &mut conn, id).await {
+                if let Err(err) = handle_message(&db, &state, &mut conn, id).await {
                     error!(error = %err, "message handling failed");
                 }
             }
@@ -84,6 +120,7 @@ async fn ensure_group(conn: &mut redis::aio::MultiplexedConnection) -> anyhow::R
 
 async fn handle_message(
     db: &PgPool,
+    state: &WorkerState,
     conn: &mut redis::aio::MultiplexedConnection,
     id: StreamId,
 ) -> anyhow::Result<()> {
@@ -96,7 +133,7 @@ async fn handle_message(
         ack(conn, STREAM_KEY, GROUP, &id.id).await?;
         return Ok(());
     }
-    match process_job(db, &job, conn).await {
+    match process_job(db, state, &job, conn).await {
         Ok(()) => {
             ack(conn, STREAM_KEY, GROUP, &id.id).await?;
         }
@@ -132,12 +169,16 @@ async fn handle_message(
 
 async fn process_job(
     db: &PgPool,
+    state: &WorkerState,
     job: &QueueJob,
     conn: &mut redis::aio::MultiplexedConnection,
 ) -> anyhow::Result<()> {
     if job.payload_json.contains("\"force_fail\":true") {
         return Err(anyhow::anyhow!("forced failure"));
     }
+    let input_payload: serde_json::Value = serde_json::from_str(&job.payload_json).unwrap_or_default();
+    let output = call_gateway_spec(state, job.run_id, input_payload).await?;
+
     sqlx::query("UPDATE runs SET status = $2 WHERE id = $1")
         .bind(job.run_id)
         .bind(RunStatus::SpecGenerating.as_str())
@@ -151,7 +192,11 @@ async fn process_job(
     .bind(job.run_id)
     .bind("spec_generation")
     .bind("completed")
-    .bind(Some(format!("processed_at={}", Utc::now().to_rfc3339())))
+    .bind(Some(format!(
+        "processed_at={},provider_output={}",
+        Utc::now().to_rfc3339(),
+        compact_json(&output)
+    )))
     .execute(db)
     .await?;
     enqueue(
@@ -162,12 +207,57 @@ async fn process_job(
             run_id: job.run_id,
             step: "codegen".to_string(),
             attempt: 1,
-            payload_json: serde_json::json!({ "source": "spec_worker" }).to_string(),
+            payload_json: serde_json::json!({
+                "source": "spec_worker",
+                "spec_output": output
+            })
+            .to_string(),
         },
     )
     .await?;
     info!(run_id = %job.run_id, "spec job processed");
     Ok(())
+}
+
+async fn call_gateway_spec(
+    state: &WorkerState,
+    run_id: Uuid,
+    input_payload: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{}/mcp/spec/extract", state.mcp_gateway_base_url);
+    let mut req = state.mcp_gateway_http.post(url).json(&GatewayRequest {
+        payload: serde_json::json!({
+            "run_id": run_id,
+            "input": input_payload
+        }),
+    });
+    if let Some(key) = state.mcp_internal_api_key.as_ref() {
+        req = req.header("x-internal-api-key", key);
+    }
+    let resp = req.send().await.context("mcp-gateway request failed")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "mcp-gateway spec failed: http {}: {}",
+            status.as_u16(),
+            body
+        ));
+    }
+    let out: GatewayResponse = resp
+        .json()
+        .await
+        .context("invalid mcp-gateway spec response")?;
+    Ok(out.raw)
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    if text.len() <= 400 {
+        text
+    } else {
+        format!("{}...", &text[..400])
+    }
 }
 
 fn parse_job(map: &HashMap<String, Value>) -> anyhow::Result<QueueJob> {
