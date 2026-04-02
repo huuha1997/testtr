@@ -73,6 +73,17 @@ services:
     environment:
       HTTP_ADDR: 0.0.0.0:8090
       RUST_LOG: info
+      MCP_INTERNAL_API_KEY: local-internal-key
+      MCP_PROVIDER_HTTP_TIMEOUT_SECONDS: 25
+      MCP_PROVIDER_MAX_RETRIES: 3
+      BANANA_API_URL: https://example.com/banana/generate
+      BANANA_API_TOKEN: banana-token
+      STITCH_API_URL: https://example.com/stitch/extract
+      STITCH_API_TOKEN: stitch-token
+      CLAUDE_API_URL: https://example.com/claude/codegen
+      CLAUDE_API_TOKEN: claude-token
+      GITHUB_API_TOKEN: ""
+      GITHUB_API_BASE: https://api.github.com
     ports:
       - "8090:8090"
 
@@ -85,11 +96,16 @@ services:
       REDIS_URL: redis://redis:6379
       RUST_LOG: info
       DESIGN_CONSUMER_NAME: design-worker-local
+      MCP_GATEWAY_URL: http://mcp-gateway:8090
+      MCP_HTTP_TIMEOUT_SECONDS: 20
+      MCP_INTERNAL_API_KEY: local-internal-key
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mcp-gateway:
+        condition: service_started
 
   spec-worker:
     build:
@@ -100,11 +116,16 @@ services:
       REDIS_URL: redis://redis:6379
       RUST_LOG: info
       SPEC_CONSUMER_NAME: spec-worker-local
+      MCP_GATEWAY_URL: http://mcp-gateway:8090
+      MCP_HTTP_TIMEOUT_SECONDS: 20
+      MCP_INTERNAL_API_KEY: local-internal-key
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mcp-gateway:
+        condition: service_started
 
   codegen-worker:
     build:
@@ -115,11 +136,16 @@ services:
       REDIS_URL: redis://redis:6379
       RUST_LOG: info
       CODEGEN_CONSUMER_NAME: codegen-worker-local
+      MCP_GATEWAY_URL: http://mcp-gateway:8090
+      MCP_HTTP_TIMEOUT_SECONDS: 20
+      MCP_INTERNAL_API_KEY: local-internal-key
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mcp-gateway:
+        condition: service_started
 
   ci-worker:
     build:
@@ -130,6 +156,7 @@ services:
       REDIS_URL: redis://redis:6379
       RUST_LOG: info
       CI_CONSUMER_NAME: ci-worker-local
+      CI_DEPLOY_VERCEL_PROJECT_NAME: agentic-preview
     depends_on:
       postgres:
         condition: service_healthy
@@ -145,11 +172,23 @@ services:
       REDIS_URL: redis://redis:6379
       RUST_LOG: info
       DEPLOY_CONSUMER_NAME: deploy-worker-local
+      MCP_GATEWAY_URL: http://mcp-gateway:8090
+      DEPLOY_HTTP_TIMEOUT_SECONDS: 20
+      MCP_INTERNAL_API_KEY: local-internal-key
+      DEPLOY_VERCEL_PROJECT_NAME: agentic-preview
+      DEPLOY_VERCEL_TEAM_ID: ""
+      DEPLOY_VERCEL_SLUG: ""
+      DEPLOY_GITHUB_OWNER: ""
+      DEPLOY_GITHUB_REPO: ""
+      DEPLOY_GITHUB_BASE_BRANCH: main
+      DEPLOY_GITHUB_HEAD_PREFIX: preview/run-
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mcp-gateway:
+        condition: service_started
 
 volumes:
   postgres_data:

@@ -49,6 +49,27 @@
 - `OAUTH_<PROVIDER>_REVOKE_URL`
 - `OAUTH_<PROVIDER>_REDIRECT_URL`
 - `OAUTH_<PROVIDER>_SCOPES`
+- `VERCEL_API_TOKEN` (cho `mcp-gateway` gọi Vercel API thật)
+- `VERCEL_API_BASE` (optional, default `https://api.vercel.com`)
+- `VERCEL_HTTP_TIMEOUT_SECONDS` (optional, default `25`)
+- `VERCEL_MAX_RETRIES` (optional, default `3`)
+- `MCP_INTERNAL_API_KEY` (optional; bật auth giữa workers và `mcp-gateway`)
+- `MCP_PROVIDER_HTTP_TIMEOUT_SECONDS` (optional, default `25`)
+- `MCP_PROVIDER_MAX_RETRIES` (optional, default `3`)
+- `BANANA_API_URL`, `BANANA_API_TOKEN` (design provider)
+- `STITCH_API_URL`, `STITCH_API_TOKEN` (spec provider)
+- `CLAUDE_API_URL`, `CLAUDE_API_TOKEN` (codegen provider)
+- `GITHUB_API_BASE` (optional, default `https://api.github.com`)
+- `GITHUB_API_TOKEN` (cho tạo PR thật ở gateway)
+- `MCP_GATEWAY_URL` (cho `deploy-worker`, default `http://localhost:8090`)
+- `DEPLOY_HTTP_TIMEOUT_SECONDS` (optional, default `20`)
+- `DEPLOY_VERCEL_PROJECT_NAME` (optional, default `agentic-preview`)
+- `DEPLOY_VERCEL_TEAM_ID` (optional)
+- `DEPLOY_VERCEL_SLUG` (optional)
+- `DEPLOY_GITHUB_OWNER`, `DEPLOY_GITHUB_REPO`
+- `DEPLOY_GITHUB_BASE_BRANCH` (optional, default `main`)
+- `DEPLOY_GITHUB_HEAD_PREFIX` (optional, default `preview/run-`)
+- `CI_DEPLOY_VERCEL_PROJECT_NAME` (optional, default `agentic-preview`)
 
 ## SSE Convention
 - Endpoint: `GET /api/runs/{run_id}/events`
@@ -83,6 +104,38 @@
 - `POST /mcp/codegen/run`
 - `POST /mcp/repo/create-pr`
 - `POST /mcp/deploy/vercel`
+
+## MCP Gateway Providers
+- `POST /mcp/design/generate`: proxy tới Banana API URL cấu hình.
+- `POST /mcp/spec/extract`: proxy tới Stitch API URL cấu hình.
+- `POST /mcp/codegen/run`: proxy tới Claude API URL cấu hình.
+- `POST /mcp/repo/create-pr`: gọi GitHub create PR thật.
+- Nếu đặt `MCP_INTERNAL_API_KEY`, mọi endpoint `/mcp/*` yêu cầu header `x-internal-api-key`.
+
+## Vercel Deploy API (gateway)
+- Endpoint: `POST /mcp/deploy/vercel`
+- Request:
+  - `team_id` (optional)
+  - `slug` (optional)
+  - `deployment` (required): object body gửi thẳng tới `POST /v13/deployments` của Vercel.
+- Response:
+  - `deployment_id`
+  - `ready_state`
+  - `deployment_url`
+  - `inspector_url`
+  - `attempt_count`
+  - `raw`
+
+## Deploy Worker -> Gateway
+- `deploy-worker` gọi `POST {MCP_GATEWAY_URL}/mcp/deploy/vercel` ở bước deploy.
+- `ci-worker` khi pass gates sẽ enqueue payload đã có sẵn `deployment` object.
+- Nếu payload job thiếu `deployment`, `deploy-worker` vẫn có fallback static deployment tối thiểu để đảm bảo luồng end-to-end chạy được.
+- `deploy-worker` sẽ gọi thêm `POST {MCP_GATEWAY_URL}/mcp/repo/create-pr` nếu có đủ config GitHub.
+- `run_steps.preview_deploy.detail` sẽ chứa:
+  - `deployment_id`
+  - `ready_state`
+  - `preview_url`
+  - `inspector_url`
 
 ## Smoke Checklist
 - API health trả về `ok`
