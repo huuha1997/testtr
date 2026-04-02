@@ -24,6 +24,18 @@
 - MCP Gateway: `http://localhost:8090`
 - Redis (host): `redis://localhost:6380`
 
+## Chạy Slint Console
+- `cargo run -p console`
+- Mặc định console gọi vào `http://localhost:8080`
+- Các thao tác có sẵn:
+  - Create run
+  - Refresh run
+  - Xem steps/timeline
+  - Start/Stop SSE realtime (`/api/runs/{run_id}/events`)
+  - Select mockup/stack
+  - Approve/Reject deploy
+  - Xem connections/metrics
+
 ## Environment Variables
 - `DATABASE_URL`
 - `REDIS_URL`

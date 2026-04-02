@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "apps/console",
   "crates/contracts",
   "crates/queue",
   "services/mcp-gateway",
