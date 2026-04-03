@@ -177,54 +177,27 @@ async fn process_job(
         return Err(anyhow::anyhow!("forced failure"));
     }
     let input_payload: serde_json::Value = serde_json::from_str(&job.payload_json).unwrap_or_default();
-    let use_stitch = input_payload.get("use_stitch").and_then(|v| v.as_bool()).unwrap_or(false)
-        || std::env::var("DESIGN_USE_STITCH").ok().filter(|v| v == "true" || v == "1").is_some();
+    let base_prompt = input_payload.get("prompt").and_then(|v| v.as_str())
+        .or_else(|| input_payload.pointer("/input/prompt").and_then(|v| v.as_str()))
+        .unwrap_or("A modern landing page");
 
     let variant_ids = ["A", "B", "C"];
     let mut mockups = serde_json::Map::new();
 
-    if use_stitch {
-        // Stitch MCP: generate_screen_from_text → 3 variants
-        let prompt = input_payload.get("prompt").and_then(|v| v.as_str())
-            .or_else(|| input_payload.pointer("/input/prompt").and_then(|v| v.as_str()))
-            .unwrap_or("A modern landing page");
-        let project_id = input_payload.get("project_id").and_then(|v| v.as_str())
-            .or_else(|| input_payload.pointer("/input/project_id").and_then(|v| v.as_str()));
-        let device_types = ["DESKTOP", "MOBILE", "TABLET"];
-        for (i, device_type) in device_types.iter().enumerate() {
-            let mut stitch_payload = serde_json::json!({
-                "prompt": prompt,
-                "model_id": "GEMINI_3_FLASH",
-                "device_type": device_type
-            });
-            if let Some(pid) = project_id {
-                stitch_payload["project_id"] = serde_json::json!(pid);
-            }
-            let output = call_gateway_stitch_generate(state, job.run_id, stitch_payload).await?;
-            mockups.insert(variant_ids[i].to_string(), output);
-        }
-    } else {
-        // Banana (Gemini 2.5 Flash): generate content with different prompts
-        let base_prompt = input_payload.get("prompt").and_then(|v| v.as_str())
-            .or_else(|| input_payload.pointer("/input/prompt").and_then(|v| v.as_str()))
-            .unwrap_or("A modern landing page");
-        let style_variants = [
-            "Clean and minimal style",
-            "Bold and colorful style with gradients",
-            "Dark theme with neon accents",
-        ];
-        for (i, style) in style_variants.iter().enumerate() {
-            let payload = serde_json::json!({
-                "prompt": format!("Generate a detailed UI design description for: {}. Style: {}. Include layout structure, color palette (hex), typography, component list, and section descriptions.", base_prompt, style)
-            });
-            let output = call_gateway_design(state, job.run_id, payload).await?;
-            mockups.insert(variant_ids[i].to_string(), output);
-        }
+    // Banana (HuggingFace FLUX) → gen 3 mockup images with different seeds
+    let seeds: [u64; 3] = [42, 137, 2048];
+    for (i, &seed) in seeds.iter().enumerate() {
+        let payload = serde_json::json!({
+            "prompt": base_prompt,
+            "seed": seed
+        });
+        let output = call_gateway_design(state, job.run_id, payload).await?;
+        mockups.insert(variant_ids[i].to_string(), output);
     }
 
     let detail = serde_json::to_string(&serde_json::json!({
         "processed_at": Utc::now().to_rfc3339(),
-        "provider": if use_stitch { "stitch" } else { "banana_gemini" },
+        "provider": "banana_flux",
         "mockups": mockups
     }))
     .unwrap_or_default();
@@ -246,8 +219,8 @@ async fn process_job(
     .execute(db)
     .await?;
 
-    // Do NOT auto-enqueue spec — wait for user to select mockup + stack
-    info!(run_id = %job.run_id, provider = if use_stitch { "stitch" } else { "banana_gemini" }, "design job processed (3 mockups ready)");
+    // Do NOT auto-enqueue — wait for user to select mockup → then Stitch worker takes over
+    info!(run_id = %job.run_id, "design job processed — 3 banana mockups ready");
     Ok(())
 }
 
@@ -280,38 +253,6 @@ async fn call_gateway_design(
         .json()
         .await
         .context("invalid mcp-gateway design response")?;
-    Ok(out.raw)
-}
-
-async fn call_gateway_stitch_generate(
-    state: &WorkerState,
-    run_id: Uuid,
-    input_payload: serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
-    let url = format!("{}/mcp/design/stitch-generate", state.mcp_gateway_base_url);
-    let mut req = state.mcp_gateway_http.post(url).json(&GatewayRequest {
-        payload: serde_json::json!({
-            "run_id": run_id,
-            "input": input_payload
-        }),
-    });
-    if let Some(key) = state.mcp_internal_api_key.as_ref() {
-        req = req.header("x-internal-api-key", key);
-    }
-    let resp = req.send().await.context("mcp-gateway stitch-generate request failed")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!(
-            "mcp-gateway stitch-generate failed: http {}: {}",
-            status.as_u16(),
-            body
-        ));
-    }
-    let out: GatewayResponse = resp
-        .json()
-        .await
-        .context("invalid mcp-gateway stitch-generate response")?;
     Ok(out.raw)
 }
 

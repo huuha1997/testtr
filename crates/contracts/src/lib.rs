@@ -11,6 +11,9 @@ pub enum RunStatus {
     MockupGenerating,
     MockupReady,
     MockupSelected,
+    StitchGenerating,
+    StitchReady,
+    StitchApproved,
     StackSelected,
     ContractLocked,
     SpecGenerating,
@@ -33,6 +36,9 @@ impl RunStatus {
             RunStatus::MockupGenerating => "mockup_generating",
             RunStatus::MockupReady => "mockup_ready",
             RunStatus::MockupSelected => "mockup_selected",
+            RunStatus::StitchGenerating => "stitch_generating",
+            RunStatus::StitchReady => "stitch_ready",
+            RunStatus::StitchApproved => "stitch_approved",
             RunStatus::StackSelected => "stack_selected",
             RunStatus::ContractLocked => "contract_locked",
             RunStatus::SpecGenerating => "spec_generating",
@@ -59,6 +65,9 @@ impl std::str::FromStr for RunStatus {
             "mockup_generating" => Ok(RunStatus::MockupGenerating),
             "mockup_ready" => Ok(RunStatus::MockupReady),
             "mockup_selected" => Ok(RunStatus::MockupSelected),
+            "stitch_generating" => Ok(RunStatus::StitchGenerating),
+            "stitch_ready" => Ok(RunStatus::StitchReady),
+            "stitch_approved" => Ok(RunStatus::StitchApproved),
             "stack_selected" => Ok(RunStatus::StackSelected),
             "contract_locked" => Ok(RunStatus::ContractLocked),
             "spec_generating" => Ok(RunStatus::SpecGenerating),
@@ -102,6 +111,11 @@ pub struct SelectMockupRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectStackRequest {
     pub stack_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApproveStitchRequest {
+    pub screen_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

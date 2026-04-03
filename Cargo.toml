@@ -10,6 +10,7 @@ members = [
   "workers/design",
   "workers/deploy",
   "workers/spec",
+  "workers/stitch",
 ]
 resolver = "2"
 

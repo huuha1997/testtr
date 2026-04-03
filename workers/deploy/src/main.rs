@@ -404,6 +404,11 @@ async fn maybe_create_pull_request(
         .pointer("/pr/draft")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    // Ensure head branch exists on GitHub (create from base if not)
+    if let Err(e) = ensure_branch_exists(state, &owner, &repo, &head, &base).await {
+        warn!("branch creation failed (non-fatal): {}", e);
+    }
+
     let req_payload = GatewayGithubCreatePrRequest {
         owner,
         repo,
@@ -438,6 +443,73 @@ async fn maybe_create_pull_request(
         out.state.unwrap_or_else(|| "unknown".to_string()),
         out.html_url.unwrap_or_else(|| "unknown".to_string())
     ))
+}
+
+async fn ensure_branch_exists(
+    state: &WorkerState,
+    owner: &str,
+    repo: &str,
+    head: &str,
+    base: &str,
+) -> anyhow::Result<()> {
+    let token = std::env::var("GITHUB_API_TOKEN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .context("GITHUB_API_TOKEN not set")?;
+    let github_base = std::env::var("GITHUB_API_BASE")
+        .unwrap_or_else(|_| "https://api.github.com".to_string());
+
+    // 1. Get SHA of base branch
+    let base_url = format!("{}/repos/{}/{}/git/ref/heads/{}", github_base, owner, repo, base);
+    let resp = state.mcp_gateway_http
+        .get(&base_url)
+        .bearer_auth(&token)
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "agentic-deploy-worker")
+        .send()
+        .await
+        .context("failed to get base branch")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("failed to get base branch {}: {} {}", base, status, body));
+    }
+
+    let base_ref: serde_json::Value = resp.json().await.context("invalid base ref response")?;
+    let sha = base_ref.pointer("/object/sha")
+        .and_then(|v| v.as_str())
+        .context("no sha in base ref")?;
+
+    // 2. Create head branch from base SHA
+    let create_url = format!("{}/repos/{}/{}/git/refs", github_base, owner, repo);
+    let resp = state.mcp_gateway_http
+        .post(&create_url)
+        .bearer_auth(&token)
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "agentic-deploy-worker")
+        .json(&json!({
+            "ref": format!("refs/heads/{}", head),
+            "sha": sha
+        }))
+        .send()
+        .await
+        .context("failed to create branch")?;
+
+    if resp.status().is_success() {
+        info!(branch = head, "created branch from {}", base);
+    } else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        // 422 = branch already exists, that's OK
+        if status.as_u16() == 422 && body.contains("Reference already exists") {
+            info!(branch = head, "branch already exists");
+        } else {
+            return Err(anyhow::anyhow!("failed to create branch {}: {} {}", head, status, body));
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_job(map: &HashMap<String, Value>) -> anyhow::Result<QueueJob> {

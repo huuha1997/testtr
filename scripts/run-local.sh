@@ -66,6 +66,7 @@ pkill -f "target/debug/design-worker" 2>/dev/null || true
 pkill -f "target/debug/spec-worker"   2>/dev/null || true
 pkill -f "target/debug/codegen-worker" 2>/dev/null || true
 pkill -f "target/debug/ci-worker"     2>/dev/null || true
+pkill -f "target/debug/stitch-worker" 2>/dev/null || true
 pkill -f "target/debug/deploy-worker" 2>/dev/null || true
 sleep 1
 
@@ -75,6 +76,7 @@ echo "[run-local] Building all packages (this may take a while)..."
     -p orchestrator \
     -p mcp-gateway \
     -p design-worker \
+    -p stitch-worker \
     -p spec-worker \
     -p codegen-worker \
     -p ci-worker \
@@ -124,6 +126,7 @@ start_service "mcp-gateway"     "mcp-gateway"  HTTP_ADDR=0.0.0.0:8090
 sleep 1
 
 start_service "design-worker"   "design-worker"
+start_service "stitch-worker"   "stitch-worker"
 start_service "spec-worker"     "spec-worker"
 start_service "codegen-worker"  "codegen-worker"
 start_service "ci-worker"       "ci-worker"
@@ -143,6 +146,7 @@ tail -f \
     "$LOG_DIR/orchestrator.log" \
     "$LOG_DIR/mcp-gateway.log" \
     "$LOG_DIR/design-worker.log" \
+    "$LOG_DIR/stitch-worker.log" \
     "$LOG_DIR/spec-worker.log" \
     "$LOG_DIR/codegen-worker.log" \
     "$LOG_DIR/ci-worker.log" \

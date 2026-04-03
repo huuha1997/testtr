@@ -39,12 +39,22 @@ slint::slint! {
         in-out property <image> mockup_image_b;
         in-out property <image> mockup_image_c;
         in-out property <bool> has_mockup: false;
+        in-out property <string> design_text_a: "";
+        in-out property <string> design_text_b: "";
+        in-out property <string> design_text_c: "";
+        in-out property <string> design_link_a: "";
+        in-out property <string> design_link_b: "";
+        in-out property <string> design_link_c: "";
+        in-out property <string> stitch_output_text: "";
+        in-out property <string> stitch_design_url: "";
         in-out property <string> preview_url: "";
         in-out property <string> pr_url: "";
 
         callback create_run(string);
         callback refresh_run(string);
         callback select_mockup(string, string);
+        callback approve_stitch(string);
+        callback open_stitch_url();
         callback select_stack(string, string);
         callback load_steps(string);
         callback load_timeline(string);
@@ -74,6 +84,9 @@ slint::slint! {
                                     root.status_text == "Done" ? #166534 :
                                     root.status_text == "Idle" ? #334155 :
                                     root.status_text == "mockup_ready" ? #854d0e :
+                                    root.status_text == "stitch_generating" ? #3730a3 :
+                                    root.status_text == "stitch_ready" ? #4338ca :
+                                    root.status_text == "stitch_approved" ? #1e40af :
                                     root.status_text == "awaiting_approval" ? #166534 :
                                     root.status_text == "SSE Connected" ? #075985 : #581c87;
                         Text {
@@ -98,7 +111,12 @@ slint::slint! {
 
                         // Prompt + Run
                         Text { text: "PROMPT"; font-size: 9px; color: #64748b; font-weight: 700; letter-spacing: 1.5px; }
-                        LineEdit { text <=> root.prompt_text; }
+                        TextEdit {
+                            height: 100px;
+                            text <=> root.prompt_text;
+                            wrap: word-wrap;
+                            font-size: 12px;
+                        }
                         Button { text: "Create Run"; clicked => { root.create_run(root.prompt_text); } }
 
                         // Run ID
@@ -148,7 +166,46 @@ slint::slint! {
                         }
                     }
 
-                    if root.status_text == "mockup_selected": Rectangle {
+                    // Stitch generating indicator
+                    if root.status_text == "mockup_selected" || root.status_text == "stitch_generating": Rectangle {
+                        height: 44px; border-radius: 10px;
+                        background: #1e1b4b;
+                        border-color: #818cf8; border-width: 1px;
+                        HorizontalBox {
+                            padding-left: 16px; padding-right: 16px; spacing: 10px;
+                            Text { text: "Stitch generating design from selected mockup..."; color: #a5b4fc; font-size: 13px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; }
+                        }
+                    }
+
+                    // Stitch ready — approve card
+                    if root.status_text == "stitch_ready": Rectangle {
+                        min-height: 160px; border-radius: 12px;
+                        background: #1e1b4b;
+                        border-color: #818cf8; border-width: 2px;
+                        VerticalBox {
+                            padding: 16px; spacing: 10px;
+                            Text { text: "STITCH DESIGN READY"; font-size: 11px; color: #818cf8; font-weight: 700; letter-spacing: 1.5px; }
+                            if root.stitch_design_url != "": Text {
+                                text: root.stitch_design_url;
+                                font-size: 12px; color: #93c5fd; font-weight: 600; wrap: word-wrap;
+                            }
+                            ScrollView {
+                                height: 60px;
+                                Text {
+                                    text: root.stitch_output_text != "" ? root.stitch_output_text : "Stitch design generated — review and approve to continue";
+                                    font-size: 11px; color: #a5b4fc; wrap: word-wrap;
+                                }
+                            }
+                            HorizontalBox {
+                                spacing: 12px;
+                                if root.stitch_design_url != "": Button { text: "Open in Browser"; clicked => { root.open_stitch_url(); } }
+                                Button { text: "Approve Design"; clicked => { root.approve_stitch(root.run_id); } }
+                            }
+                        }
+                    }
+
+                    // Stack selection — now requires stitch_approved
+                    if root.status_text == "stitch_approved": Rectangle {
                         height: 60px; border-radius: 10px;
                         background: #172554;
                         border-color: #3b82f6; border-width: 1px;
@@ -179,40 +236,67 @@ slint::slint! {
                         }
                     }
 
-                    // 3 MOCKUP IMAGES (only during selection phase)
+                    // 3 MOCKUP CARDS (only during selection phase)
                     if root.has_mockup && (root.status_text == "mockup_ready" || root.status_text == "mockup_selected"): HorizontalBox {
                         spacing: 10px;
                         vertical-stretch: 1;
 
+                        // ── Card A ──
                         Rectangle {
                             horizontal-stretch: 1; border-radius: 10px; background: #1e293b;
                             border-color: root.status_text == "mockup_ready" ? #475569 : #334155; border-width: 1px;
                             VerticalBox {
                                 padding: 8px; spacing: 6px;
-                                Text { text: "A"; font-size: 12px; color: #94a3b8; font-weight: 800; horizontal-alignment: center; }
+                                Text { text: "A — Minimal"; font-size: 12px; color: #94a3b8; font-weight: 800; horizontal-alignment: center; }
                                 Image { source: root.mockup_image_a; horizontal-stretch: 1; vertical-stretch: 1; image-fit: contain; }
+                                if root.design_link_a != "": Rectangle {
+                                    height: 24px; border-radius: 4px; background: #1e40af;
+                                    Text { text: "View Design ↗"; color: #93c5fd; font-size: 10px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                ScrollView {
+                                    height: 80px;
+                                    Text { text: root.design_text_a; font-size: 10px; color: #94a3b8; wrap: word-wrap; }
+                                }
                                 if root.status_text == "mockup_ready": Button { text: "Select A"; clicked => { root.select_mockup(root.run_id, "A"); } }
                             }
                         }
 
+                        // ── Card B ──
                         Rectangle {
                             horizontal-stretch: 1; border-radius: 10px; background: #1e293b;
                             border-color: root.status_text == "mockup_ready" ? #475569 : #334155; border-width: 1px;
                             VerticalBox {
                                 padding: 8px; spacing: 6px;
-                                Text { text: "B"; font-size: 12px; color: #94a3b8; font-weight: 800; horizontal-alignment: center; }
+                                Text { text: "B — Colorful"; font-size: 12px; color: #94a3b8; font-weight: 800; horizontal-alignment: center; }
                                 Image { source: root.mockup_image_b; horizontal-stretch: 1; vertical-stretch: 1; image-fit: contain; }
+                                if root.design_link_b != "": Rectangle {
+                                    height: 24px; border-radius: 4px; background: #1e40af;
+                                    Text { text: "View Design ↗"; color: #93c5fd; font-size: 10px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                ScrollView {
+                                    height: 80px;
+                                    Text { text: root.design_text_b; font-size: 10px; color: #94a3b8; wrap: word-wrap; }
+                                }
                                 if root.status_text == "mockup_ready": Button { text: "Select B"; clicked => { root.select_mockup(root.run_id, "B"); } }
                             }
                         }
 
+                        // ── Card C ──
                         Rectangle {
                             horizontal-stretch: 1; border-radius: 10px; background: #1e293b;
                             border-color: root.status_text == "mockup_ready" ? #475569 : #334155; border-width: 1px;
                             VerticalBox {
                                 padding: 8px; spacing: 6px;
-                                Text { text: "C"; font-size: 12px; color: #94a3b8; font-weight: 800; horizontal-alignment: center; }
+                                Text { text: "C — Dark Neon"; font-size: 12px; color: #94a3b8; font-weight: 800; horizontal-alignment: center; }
                                 Image { source: root.mockup_image_c; horizontal-stretch: 1; vertical-stretch: 1; image-fit: contain; }
+                                if root.design_link_c != "": Rectangle {
+                                    height: 24px; border-radius: 4px; background: #1e40af;
+                                    Text { text: "View Design ↗"; color: #93c5fd; font-size: 10px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                ScrollView {
+                                    height: 80px;
+                                    Text { text: root.design_text_c; font-size: 10px; color: #94a3b8; wrap: word-wrap; }
+                                }
                                 if root.status_text == "mockup_ready": Button { text: "Select C"; clicked => { root.select_mockup(root.run_id, "C"); } }
                             }
                         }
@@ -286,6 +370,13 @@ impl OrchestratorApi {
 
     fn select_mockup(&self, run_id: &str, mockup_id: String) -> Result<TransitionRunResponse> {
         self.post_json(&format!("/api/runs/{run_id}/select-mockup"), &SelectMockupRequest { mockup_id })
+    }
+
+    fn approve_stitch(&self, run_id: &str) -> Result<TransitionRunResponse> {
+        self.post_json(
+            &format!("/api/runs/{run_id}/approve-stitch"),
+            &contracts::ApproveStitchRequest { screen_id: None },
+        )
     }
 
     fn select_stack(&self, run_id: &str, stack_id: String) -> Result<TransitionRunResponse> {
@@ -443,7 +534,8 @@ type StepMap = Arc<Mutex<HashMap<String, String>>>;
 fn format_steps_display(map: &HashMap<String, String>) -> String {
     if map.is_empty() { return String::new(); }
     let order = [
-        "mockup_generation", "spec_generation", "codegen",
+        "mockup_generation", "mockup_selection", "stitch_generation", "stitch_approval",
+        "spec_generation", "codegen",
         "ci_gate_lint", "ci_gate_typecheck", "ci_gate_build",
         "ci_gate_e2e", "ci_gate_visual", "ci_gate_a11y",
         "pr_create", "preview_deploy", "deploy_approval", "self_heal",
@@ -498,9 +590,31 @@ fn decode_mockup_image(b64: &str) -> Option<slint::SharedPixelBuffer<slint::Rgba
 }
 
 fn try_set_mockup_images(weak: &slint::Weak<AppWindow>, api: &OrchestratorApi, run_id: &str) {
-    eprintln!("[mockup] fetching steps for {}", run_id);
-    let Ok(steps) = api.list_steps(run_id) else {
-        eprintln!("[mockup] failed to fetch steps");
+    // Retry a few times — DB detail may not be committed yet when SSE fires
+    let mut steps_result = None;
+    for retry in 0..5 {
+        if retry > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        eprintln!("[mockup] fetching steps for {} (attempt {})", run_id, retry + 1);
+        let Ok(steps) = api.list_steps(run_id) else {
+            eprintln!("[mockup] failed to fetch steps");
+            continue;
+        };
+        // Check if mockup_generation has real JSON detail (not just the queued placeholder)
+        let has_real_detail = steps.steps.iter().any(|s| {
+            s.step_key == "mockup_generation"
+                && s.status == "completed"
+                && s.detail.as_ref().map(|d| d.starts_with("{\"")).unwrap_or(false)
+        });
+        if has_real_detail {
+            steps_result = Some(steps);
+            break;
+        }
+        eprintln!("[mockup] detail not ready yet, retrying...");
+    }
+    let Some(steps) = steps_result else {
+        eprintln!("[mockup] gave up waiting for mockup detail");
         return;
     };
     for step in &steps.steps {
@@ -511,7 +625,6 @@ fn try_set_mockup_images(weak: &slint::Weak<AppWindow>, api: &OrchestratorApi, r
         };
         eprintln!("[mockup] detail len={}, starts with: {}", detail.len(), &detail[..detail.len().min(80)]);
 
-        // New format: JSON {"processed_at":"...","mockups":{"A":{...},"B":{...},"C":{...}}}
         let val: serde_json::Value = match serde_json::from_str(detail) {
             Ok(v) => v,
             Err(e) => {
@@ -523,34 +636,116 @@ fn try_set_mockup_images(weak: &slint::Weak<AppWindow>, api: &OrchestratorApi, r
             eprintln!("[mockup] no 'mockups' key in JSON");
             continue;
         };
-        eprintln!("[mockup] found {} mockups: {:?}", mockups.len(), mockups.keys().collect::<Vec<_>>());
+        let pipeline = val.get("pipeline").and_then(|v| v.as_str()).unwrap_or("unknown");
+        eprintln!("[mockup] found {} mockups (pipeline={}): {:?}", mockups.len(), pipeline, mockups.keys().collect::<Vec<_>>());
 
         let ids = [("A", 0u8), ("B", 1), ("C", 2)];
-        let mut buffers: [Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>>; 3] =
-            [None, None, None];
+        let mut buffers: [Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>>; 3] = [None, None, None];
+        let mut texts: [String; 3] = [String::new(), String::new(), String::new()];
+        let mut links: [String; 3] = [String::new(), String::new(), String::new()];
 
         for (id, idx) in ids {
             let Some(entry) = mockups.get(id) else {
                 eprintln!("[mockup] missing variant {}", id);
                 continue;
             };
-            let Some(b64) = entry.get("image_base64").and_then(|v| v.as_str()) else {
-                eprintln!("[mockup] variant {} has no image_base64", id);
-                continue;
-            };
-            eprintln!("[mockup] decoding variant {} (b64 len={})", id, b64.len());
-            buffers[idx as usize] = decode_mockup_image(b64);
-            eprintln!("[mockup] variant {} decoded: {}", id, buffers[idx as usize].is_some());
+
+            // Try image_base64 (FLUX / image provider)
+            if let Some(b64) = entry.get("image_base64").and_then(|v| v.as_str()) {
+                eprintln!("[mockup] decoding image variant {} (b64 len={})", id, b64.len());
+                buffers[idx as usize] = decode_mockup_image(b64);
+            }
+
+            // Extract text from Gemini response (banana_mockup or direct)
+            let banana = entry.get("banana_mockup").unwrap_or(entry);
+            if let Some(text) = banana.pointer("/candidates/0/content/parts/0/text").and_then(|v| v.as_str()) {
+                let truncated = if text.len() > 300 { format!("{}...", &text[..297]) } else { text.to_string() };
+                texts[idx as usize] = truncated;
+                eprintln!("[mockup] variant {} has Gemini text (len={})", id, text.len());
+            } else if let Some(text) = banana.get("raw_text").and_then(|v| v.as_str()) {
+                let truncated = if text.len() > 300 { format!("{}...", &text[..297]) } else { text.to_string() };
+                texts[idx as usize] = truncated;
+            }
+
+            // Extract Stitch screen link
+            let stitch = entry.get("stitch_screen");
+            if let Some(stitch_data) = stitch {
+                // Try to find screen URL from Stitch response
+                if let Some(url) = stitch_data.pointer("/result/content/0/text").and_then(|v| v.as_str()) {
+                    if url.contains("stitch.withgoogle.com") || url.starts_with("http") {
+                        links[idx as usize] = url.to_string();
+                    }
+                }
+                if let Some(screen_id) = stitch_data.pointer("/result/content/0/resource/uri").and_then(|v| v.as_str()) {
+                    links[idx as usize] = screen_id.to_string();
+                }
+                // Also try direct fields
+                if links[idx as usize].is_empty() {
+                    if let Some(url) = stitch_data.get("url").and_then(|v| v.as_str()) {
+                        links[idx as usize] = url.to_string();
+                    }
+                }
+                eprintln!("[mockup] variant {} stitch link: {}", id,
+                    if links[idx as usize].is_empty() { "none" } else { &links[idx as usize] });
+            }
         }
 
         let [buf_a, buf_b, buf_c] = buffers;
+        let [text_a, text_b, text_c] = texts;
+        let [link_a, link_b, link_c] = links;
         let weak = weak.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = weak.upgrade() {
                 if let Some(b) = buf_a { ui.set_mockup_image_a(slint::Image::from_rgba8(b)); }
                 if let Some(b) = buf_b { ui.set_mockup_image_b(slint::Image::from_rgba8(b)); }
                 if let Some(b) = buf_c { ui.set_mockup_image_c(slint::Image::from_rgba8(b)); }
+                ui.set_design_text_a(text_a.into());
+                ui.set_design_text_b(text_b.into());
+                ui.set_design_text_c(text_c.into());
+                ui.set_design_link_a(link_a.into());
+                ui.set_design_link_b(link_b.into());
+                ui.set_design_link_c(link_c.into());
                 ui.set_has_mockup(true);
+            }
+        });
+        return;
+    }
+}
+
+fn fetch_and_set_stitch_output(weak: &slint::Weak<AppWindow>, api: &OrchestratorApi, run_id: &str) {
+    let Ok(steps) = api.list_steps(run_id) else { return; };
+    for step in &steps.steps {
+        if step.step_key != "stitch_generation" { continue; }
+        let Some(ref detail) = step.detail else { continue; };
+        let val: serde_json::Value = match serde_json::from_str(detail) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Extract useful info from stitch output
+        let mut display_text = String::new();
+        if let Some(output) = val.get("stitch_output") {
+            // Try to get text from MCP response
+            if let Some(text) = output.pointer("/result/content/0/text").and_then(|v| v.as_str()) {
+                display_text = text.to_string();
+            } else {
+                // Fallback: pretty-print the output (truncated)
+                let json_str = serde_json::to_string_pretty(output).unwrap_or_default();
+                display_text = if json_str.len() > 500 {
+                    format!("{}...", &json_str[..497])
+                } else {
+                    json_str
+                };
+            }
+        }
+        if let Some(mockup_id) = val.get("selected_mockup_id").and_then(|v| v.as_str()) {
+            display_text = format!("Selected mockup: {}\n\n{}", mockup_id, display_text);
+        }
+        let stitch_url = val.get("stitch_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_stitch_output_text(display_text.into());
+                ui.set_stitch_design_url(stitch_url.into());
             }
         });
         return;
@@ -709,6 +904,40 @@ fn main() -> Result<()> {
                 let api = OrchestratorApi::new(base_url)?;
                 let res = api.select_mockup(&run_id, mockup_id)?;
                 Ok((Some(run_id), format!("Mockup selected:\n{}", pretty(&res))))
+            });
+        });
+    }
+
+    // Open Stitch URL in browser
+    {
+        let weak = weak.clone();
+        ui.on_open_stitch_url(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            let url = ui.get_stitch_design_url().to_string();
+            if !url.is_empty() {
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+                #[cfg(target_os = "linux")]
+                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                #[cfg(target_os = "windows")]
+                let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn();
+            }
+        });
+    }
+
+    // Approve Stitch
+    {
+        let weak = weak.clone();
+        ui.on_approve_stitch(move |run_id| {
+            let Some(ui) = weak.upgrade() else { return; };
+            let base_url = ui.get_base_url().to_string();
+            drop(ui);
+            let run_id = run_id.to_string();
+            run_action(&weak, "Approving stitch", move || {
+                let run_id = require_run_id(run_id)?;
+                let api = OrchestratorApi::new(base_url)?;
+                let res = api.approve_stitch(&run_id)?;
+                Ok((Some(run_id), format!("Stitch approved:\n{}", pretty(&res))))
             });
         });
     }
@@ -973,6 +1202,14 @@ fn main() -> Result<()> {
                                             let weak2 = weak_t.clone();
                                             thread::spawn(move || {
                                                 try_set_mockup_images(&weak2, &api2, &run_id2);
+                                            });
+                                        }
+                                        if status.as_str() == "stitch_ready" {
+                                            let api2 = api.clone();
+                                            let run_id2 = run_id.clone();
+                                            let weak2 = weak_t.clone();
+                                            thread::spawn(move || {
+                                                fetch_and_set_stitch_output(&weak2, &api2, &run_id2);
                                             });
                                         }
                                         if status.as_str() == "preview_deployed"

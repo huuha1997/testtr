@@ -14,12 +14,12 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use contracts::{
-    Connection, ConnectionProvider, CreateRunRequest, CreateRunResponse, DeleteConnectionResponse,
-    ListConnectionsResponse, ListRunStepsResponse, MetricsSummaryResponse, OAuthCallbackRequest,
-    OAuthStartRequest, OAuthStartResponse, RefreshConnectionResponse, RejectDeployRequest,
-    RevokeConnectionResponse, Run, RunStatus, RunStep, RunTimelineItem, RunTimelineResponse,
-    SelectMockupRequest, SelectStackRequest, SseEvent, TransitionRunResponse,
-    UpsertConnectionRequest, UpsertConnectionResponse,
+    ApproveStitchRequest, Connection, ConnectionProvider, CreateRunRequest, CreateRunResponse,
+    DeleteConnectionResponse, ListConnectionsResponse, ListRunStepsResponse,
+    MetricsSummaryResponse, OAuthCallbackRequest, OAuthStartRequest, OAuthStartResponse,
+    RefreshConnectionResponse, RejectDeployRequest, RevokeConnectionResponse, Run, RunStatus,
+    RunStep, RunTimelineItem, RunTimelineResponse, SelectMockupRequest, SelectStackRequest,
+    SseEvent, TransitionRunResponse, UpsertConnectionRequest, UpsertConnectionResponse,
 };
 use futures_util::stream::{self, Stream};
 use queue::{QueueJob, enqueue};
@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/runs", post(create_run))
         .route("/api/runs/{run_id}", get(get_run))
         .route("/api/runs/{run_id}/select-mockup", post(select_mockup))
+        .route("/api/runs/{run_id}/approve-stitch", post(approve_stitch))
         .route("/api/runs/{run_id}/select-stack", post(select_stack))
         .route("/api/runs/{run_id}/steps", get(list_run_steps))
         .route("/api/runs/{run_id}/timeline", get(list_run_timeline))
@@ -222,7 +223,72 @@ async fn select_mockup(
         run_id,
         "mockup_selection".to_string(),
         "completed".to_string(),
-        Some(payload.mockup_id),
+        Some(payload.mockup_id.clone()),
+    )
+    .await?;
+
+    // Fetch the selected mockup data and enqueue Stitch design generation
+    let prompt_row = sqlx::query_as::<_, (String,)>("SELECT prompt FROM runs WHERE id = $1")
+        .bind(run_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let prompt = prompt_row.map(|r| r.0).unwrap_or_default();
+
+    // Get the banana mockup description for the selected variant
+    let mockup_step = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT detail FROM run_steps WHERE run_id = $1 AND step_key = 'mockup_generation'",
+    )
+    .bind(run_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mockup_detail = mockup_step.and_then(|r| r.0).unwrap_or_default();
+
+    let mut conn = state.redis.get_multiplexed_async_connection().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    enqueue(
+        &mut conn,
+        "q.stitch",
+        &QueueJob {
+            job_id: Uuid::new_v4(),
+            run_id,
+            step: "stitch_generation".to_string(),
+            attempt: 1,
+            payload_json: serde_json::json!({
+                "prompt": prompt,
+                "selected_mockup_id": payload.mockup_id,
+                "mockup_detail": mockup_detail,
+                "source": "mockup_selected"
+            })
+            .to_string(),
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(TransitionRunResponse { run }))
+}
+
+async fn approve_stitch(
+    State(state): State<AppState>,
+    Path(run_id): Path<Uuid>,
+    Json(payload): Json<ApproveStitchRequest>,
+) -> Result<Json<TransitionRunResponse>, (StatusCode, String)> {
+    let current = get_run_status(&state.db, run_id).await?;
+    if current != RunStatus::StitchReady {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("run is not at stitch_ready (current: {})", current.as_str()),
+        ));
+    }
+    let run = set_run_status(&state.db, run_id, RunStatus::StitchApproved).await?;
+    upsert_step(
+        &state.db,
+        run_id,
+        "stitch_approval".to_string(),
+        "completed".to_string(),
+        payload.screen_id.or(Some("approved".to_string())),
     )
     .await?;
     Ok(Json(TransitionRunResponse { run }))
@@ -237,10 +303,10 @@ async fn select_stack(
         return Err((StatusCode::BAD_REQUEST, "stack_id is empty".to_string()));
     }
     let current = get_run_status(&state.db, run_id).await?;
-    if current != RunStatus::MockupSelected {
+    if current != RunStatus::StitchApproved && current != RunStatus::MockupSelected {
         return Err((
             StatusCode::CONFLICT,
-            "run is not at mockup_selected".to_string(),
+            format!("run is not at stitch_approved or mockup_selected (current: {})", current.as_str()),
         ));
     }
     let run = set_run_status(&state.db, run_id, RunStatus::StackSelected).await?;
