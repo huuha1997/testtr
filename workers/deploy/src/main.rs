@@ -254,8 +254,8 @@ async fn process_job(db: &PgPool, state: &WorkerState, job: &QueueJob) -> anyhow
     )
     .await?;
 
-    let gateway_request = build_gateway_deploy_request(state, job.run_id, &job.payload_json)?;
-    let deployed = trigger_vercel_preview(state, &gateway_request).await?;
+    // Deploy via Vercel CLI (more reliable than API token)
+    let deployed = deploy_via_vercel_cli(job.run_id, &job.payload_json).await?;
 
     sqlx::query("UPDATE runs SET status = $2 WHERE id = $1")
         .bind(job.run_id)
@@ -268,13 +268,8 @@ async fn process_job(db: &PgPool, state: &WorkerState, job: &QueueJob) -> anyhow
         "preview_deploy".to_string(),
         "completed".to_string(),
         Some(format!(
-            "deployment_id={},ready_state={},preview_url={},inspector_url={}",
-            deployed.deployment_id,
-            deployed.ready_state.unwrap_or_else(|| "unknown".to_string()),
-            deployed
-                .deployment_url
-                .unwrap_or_else(|| "unknown".to_string()),
-            deployed.inspector_url.unwrap_or_else(|| "unknown".to_string())
+            "preview_url={},inspect_url={}",
+            deployed.0, deployed.1
         )),
     )
     .await?;
@@ -447,6 +442,65 @@ async fn maybe_create_pull_request(
         out.state.unwrap_or_else(|| "unknown".to_string()),
         out.html_url.unwrap_or_else(|| "unknown".to_string())
     ))
+}
+
+/// Deploy using Vercel CLI instead of API (avoids token expiration issues)
+async fn deploy_via_vercel_cli(
+    run_id: Uuid,
+    payload_json: &str,
+) -> anyhow::Result<(String, String)> {
+    let payload: serde_json::Value = serde_json::from_str(payload_json).unwrap_or_default();
+
+    // Extract HTML from deployment payload or codegen_output
+    let html = payload.pointer("/deployment/files/0/data")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.pointer("/codegen_output/choices/0/message/content").and_then(|v| v.as_str()))
+        .unwrap_or("<!doctype html><html><body><h1>Agentic Preview</h1></body></html>");
+
+    // Write to temp dir
+    let run_short = &run_id.to_string()[..8];
+    let deploy_dir = format!("/tmp/agentic-deploy-{}", run_short);
+    tokio::fs::create_dir_all(&deploy_dir).await.context("mkdir failed")?;
+    tokio::fs::write(format!("{}/index.html", deploy_dir), html).await.context("write html failed")?;
+
+    info!(run_id = %run_id, dir = %deploy_dir, html_len = html.len(), "deploying via vercel cli");
+
+    let output = tokio::process::Command::new("npx")
+        .args(["vercel", "deploy", "--yes"])
+        .current_dir(&deploy_dir)
+        .output()
+        .await
+        .context("vercel deploy command failed")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("vercel deploy failed: {} {}", stderr, stdout));
+    }
+
+    // Parse deployment URL from stdout (last line is usually the URL)
+    let deploy_url = stdout.lines()
+        .rev()
+        .find(|l| l.starts_with("https://"))
+        .unwrap_or("unknown")
+        .trim()
+        .to_string();
+
+    // Try to find inspect URL
+    let inspect_url = stderr.lines()
+        .chain(stdout.lines())
+        .find(|l| l.contains("vercel.com") && l.contains("Inspect"))
+        .and_then(|l| l.split_whitespace().find(|w| w.starts_with("https://")))
+        .unwrap_or("unknown")
+        .to_string();
+
+    info!(run_id = %run_id, %deploy_url, "vercel deploy complete");
+
+    // Cleanup
+    let _ = tokio::fs::remove_dir_all(&deploy_dir).await;
+
+    Ok((deploy_url, inspect_url))
 }
 
 async fn ensure_branch_with_content(

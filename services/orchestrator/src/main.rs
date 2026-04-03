@@ -319,44 +319,95 @@ async fn select_stack(
     )
     .await?;
 
-    // Fetch prompt and selected mockup_id, then kick off spec generation
-    let prompt_row = sqlx::query_as::<_, (String,)>("SELECT prompt FROM runs WHERE id = $1")
-        .bind(run_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let mockup_row = sqlx::query_as::<_, (Option<String>,)>(
-        "SELECT detail FROM run_steps WHERE run_id = $1 AND step_key = 'mockup_selection'",
+    // Check if Stitch already generated HTML — if so, skip spec+codegen and go to CI directly
+    let stitch_row = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT detail FROM run_steps WHERE run_id = $1 AND step_key = 'stitch_generation'",
     )
     .bind(run_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let prompt = prompt_row.map(|r| r.0).unwrap_or_default();
-    let selected_mockup_id = mockup_row.and_then(|r| r.0).unwrap_or_else(|| "A".to_string());
+    let stitch_html = stitch_row
+        .and_then(|r| r.0)
+        .and_then(|detail| {
+            let val: serde_json::Value = serde_json::from_str(&detail).ok()?;
+            val.get("screen_html").and_then(|v| v.as_str()).map(|s| s.to_string())
+        });
 
     let mut conn = state.redis.get_multiplexed_async_connection().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    enqueue(
-        &mut conn,
-        "q.spec",
-        &QueueJob {
-            job_id: Uuid::new_v4(),
-            run_id,
-            step: "spec_generation".to_string(),
-            attempt: 1,
-            payload_json: serde_json::json!({
-                "prompt": prompt,
-                "selected_mockup_id": selected_mockup_id,
-                "stack_id": payload.stack_id,
-                "source": "user_selection"
-            })
-            .to_string(),
-        },
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if let Some(html) = stitch_html {
+        // Stitch HTML available — skip spec+codegen, go straight to CI → deploy
+        info!("stitch HTML found ({} chars), skipping spec+codegen", html.len());
+        upsert_step(&state.db, run_id, "spec_generation".to_string(), "completed".to_string(),
+            Some("skipped: using Stitch HTML".to_string())).await?;
+        upsert_step(&state.db, run_id, "codegen".to_string(), "completed".to_string(),
+            Some("skipped: using Stitch HTML".to_string())).await?;
+
+        let run_short = &run_id.to_string()[..8];
+        enqueue(
+            &mut conn,
+            "q.ci",
+            &QueueJob {
+                job_id: Uuid::new_v4(),
+                run_id,
+                step: "ci".to_string(),
+                attempt: 1,
+                payload_json: serde_json::json!({
+                    "source": "stitch_html",
+                    "repair_iteration": 0,
+                    "codegen_output": {
+                        "choices": [{
+                            "message": { "content": html },
+                            "finish_reason": "stop"
+                        }]
+                    }
+                })
+                .to_string(),
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    } else {
+        // No Stitch HTML — fall back to spec → codegen pipeline
+        let prompt_row = sqlx::query_as::<_, (String,)>("SELECT prompt FROM runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mockup_row = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT detail FROM run_steps WHERE run_id = $1 AND step_key = 'mockup_selection'",
+        )
+        .bind(run_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let prompt = prompt_row.map(|r| r.0).unwrap_or_default();
+        let selected_mockup_id = mockup_row.and_then(|r| r.0).unwrap_or_else(|| "A".to_string());
+
+        enqueue(
+            &mut conn,
+            "q.spec",
+            &QueueJob {
+                job_id: Uuid::new_v4(),
+                run_id,
+                step: "spec_generation".to_string(),
+                attempt: 1,
+                payload_json: serde_json::json!({
+                    "prompt": prompt,
+                    "selected_mockup_id": selected_mockup_id,
+                    "stack_id": payload.stack_id,
+                    "source": "user_selection"
+                })
+                .to_string(),
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
 
     Ok(Json(TransitionRunResponse { run }))
 }

@@ -259,10 +259,51 @@ async fn process_job(
     };
     info!(run_id = %job.run_id, %stitch_url, "stitch design URL");
 
+    // Get screen_id from output, then fetch actual HTML code via get_screen_code
+    let screen_id = output.pointer("/outputComponents/0/screenId")
+        .or_else(|| output.get("screenId"))
+        .or_else(|| output.pointer("/screen_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let screen_html = if let Some(ref sid) = screen_id {
+        info!(run_id = %job.run_id, screen_id = %sid, "fetching screen HTML from Stitch");
+        let code_args = serde_json::json!({
+            "project_id": stitch_project_id_val,
+            "screen_id": sid
+        });
+        match call_stitch_cli("get_screen_code", &code_args).await {
+            Ok(code_output) => {
+                // Extract HTML from response
+                let html = code_output.get("html")
+                    .or_else(|| code_output.get("code"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        // Try raw_text
+                        code_output.get("raw_text").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    });
+                if let Some(ref h) = html {
+                    info!(run_id = %job.run_id, html_len = h.len(), "got screen HTML");
+                }
+                html
+            }
+            Err(e) => {
+                warn!(run_id = %job.run_id, error = %e, "failed to get screen code, will use codegen fallback");
+                None
+            }
+        }
+    } else {
+        warn!(run_id = %job.run_id, "no screen_id in stitch output, cannot fetch HTML");
+        None
+    };
+
     let detail = serde_json::to_string(&serde_json::json!({
         "processed_at": Utc::now().to_rfc3339(),
         "selected_mockup_id": selected_mockup_id,
         "stitch_url": stitch_url,
+        "screen_id": screen_id,
+        "screen_html": screen_html,
         "stitch_output": output
     }))
     .unwrap_or_default();
