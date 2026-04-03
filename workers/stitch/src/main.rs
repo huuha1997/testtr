@@ -253,43 +253,63 @@ async fn process_job(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let stitch_url = if let Some(ref sid) = session_id {
-        format!("https://stitch.withgoogle.com/project/{}/session/{}", stitch_project_id_val, sid)
+        format!("https://stitch.withgoogle.com/projects/{}/session/{}", stitch_project_id_val, sid)
     } else {
-        format!("https://stitch.withgoogle.com/project/{}", stitch_project_id_val)
+        format!("https://stitch.withgoogle.com/projects/{}", stitch_project_id_val)
     };
     info!(run_id = %job.run_id, %stitch_url, "stitch design URL");
 
-    // Get screen_id from output, then fetch actual HTML code via get_screen_code
-    let screen_id = output.pointer("/outputComponents/0/screenId")
+    // Get screen_id from output — Stitch nests it in design.screens[0].id
+    let screen_id = output.pointer("/outputComponents/1/design/screens/0/id")
+        .or_else(|| output.pointer("/outputComponents/0/design/screens/0/id"))
+        .or_else(|| output.pointer("/outputComponents/0/screenId"))
         .or_else(|| output.get("screenId"))
-        .or_else(|| output.pointer("/screen_id"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    info!(run_id = %job.run_id, screen_id = ?screen_id, "extracted screen_id from stitch output");
 
     let screen_html = if let Some(ref sid) = screen_id {
         info!(run_id = %job.run_id, screen_id = %sid, "fetching screen HTML from Stitch");
-        let code_args = serde_json::json!({
+        let screen_args = serde_json::json!({
             "project_id": stitch_project_id_val,
             "screen_id": sid
         });
-        match call_stitch_cli("get_screen_code", &code_args).await {
-            Ok(code_output) => {
-                // Extract HTML from response
-                let html = code_output.get("html")
-                    .or_else(|| code_output.get("code"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        // Try raw_text
-                        code_output.get("raw_text").and_then(|v| v.as_str()).map(|s| s.to_string())
-                    });
-                if let Some(ref h) = html {
-                    info!(run_id = %job.run_id, html_len = h.len(), "got screen HTML");
+        match call_stitch_cli("get_screen", &screen_args).await {
+            Ok(screen_data) => {
+                // get_screen returns htmlCode.downloadUrl — download the actual HTML
+                let download_url = screen_data.pointer("/htmlCode/downloadUrl")
+                    .and_then(|v| v.as_str());
+                if let Some(url) = download_url {
+                    info!(run_id = %job.run_id, "downloading HTML from Stitch CDN");
+                    match state.mcp_gateway_http.get(url).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.text().await {
+                                Ok(html) => {
+                                    info!(run_id = %job.run_id, html_len = html.len(), "got Stitch HTML");
+                                    Some(html)
+                                }
+                                Err(e) => {
+                                    warn!(run_id = %job.run_id, error = %e, "failed to read HTML body");
+                                    None
+                                }
+                            }
+                        }
+                        Ok(resp) => {
+                            warn!(run_id = %job.run_id, status = %resp.status(), "HTML download failed");
+                            None
+                        }
+                        Err(e) => {
+                            warn!(run_id = %job.run_id, error = %e, "HTML download request failed");
+                            None
+                        }
+                    }
+                } else {
+                    warn!(run_id = %job.run_id, "no htmlCode.downloadUrl in get_screen response");
+                    None
                 }
-                html
             }
             Err(e) => {
-                warn!(run_id = %job.run_id, error = %e, "failed to get screen code, will use codegen fallback");
+                warn!(run_id = %job.run_id, error = %e, "get_screen failed");
                 None
             }
         }
