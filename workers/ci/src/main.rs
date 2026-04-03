@@ -162,6 +162,7 @@ async fn process_job(
         .get("repair_iteration")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+    let codegen_output = payload.get("codegen_output").cloned();
     let failing_gates: Vec<String> = payload
         .get("force_fail_gates")
         .and_then(|v| v.as_array())
@@ -251,7 +252,7 @@ async fn process_job(
             payload_json: serde_json::json!({
                 "source": "ci_worker",
                 "repair_iteration": repair_iteration,
-                "deployment": build_deployment_payload(job.run_id, repair_iteration)
+                "deployment": build_deployment_payload_with_output(job.run_id, repair_iteration, codegen_output.as_ref())
             })
             .to_string(),
         },
@@ -261,7 +262,35 @@ async fn process_job(
     Ok(())
 }
 
+fn extract_html_from_codegen(codegen_output: &serde_json::Value) -> Option<String> {
+    let content = codegen_output
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())?;
+    let trimmed = content.trim();
+    // Strip markdown code fences if present
+    let html = if trimmed.starts_with("```html") {
+        trimmed.trim_start_matches("```html").trim_end_matches("```").trim()
+    } else if trimmed.starts_with("```") {
+        trimmed.trim_start_matches("```").trim_end_matches("```").trim()
+    } else {
+        trimmed
+    };
+    if html.contains("<html") || html.contains("<!doctype") || html.contains("<div") {
+        Some(html.to_string())
+    } else {
+        None
+    }
+}
+
 fn build_deployment_payload(run_id: Uuid, repair_iteration: i64) -> serde_json::Value {
+    build_deployment_payload_with_output(run_id, repair_iteration, None)
+}
+
+fn build_deployment_payload_with_output(
+    run_id: Uuid,
+    repair_iteration: i64,
+    codegen_output: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let project_name = std::env::var("CI_DEPLOY_VERCEL_PROJECT_NAME")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -269,22 +298,18 @@ fn build_deployment_payload(run_id: Uuid, repair_iteration: i64) -> serde_json::
     let run_id_str = run_id.to_string();
     let run_short = &run_id_str[..8];
     let now = Utc::now().to_rfc3339();
+
+    let html = codegen_output
+        .and_then(|o| extract_html_from_codegen(o))
+        .unwrap_or_else(|| format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Agentic Preview</title></head><body><h1>Agentic Preview</h1><p>run_id={}</p><p>repair_iteration={}</p><p>generated_at={}</p></body></html>",
+            run_id, repair_iteration, now
+        ));
+
     serde_json::json!({
         "name": format!("{}-{}", project_name, run_short),
-        "files": [
-            {
-                "file": "index.html",
-                "data": format!(
-                    "<!doctype html><html><head><meta charset=\"utf-8\"><title>Agentic Preview</title></head><body><h1>Agentic Preview</h1><p>run_id={}</p><p>repair_iteration={}</p><p>generated_at={}</p></body></html>",
-                    run_id,
-                    repair_iteration,
-                    now
-                )
-            }
-        ],
-        "projectSettings": {
-            "framework": null
-        }
+        "files": [{ "file": "index.html", "data": html }],
+        "projectSettings": { "framework": null }
     })
 }
 

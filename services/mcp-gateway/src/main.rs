@@ -220,6 +220,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/mcp/design/generate", post(handle_design_generate))
+        .route("/mcp/design/stitch-generate", post(handle_stitch_generate))
+        .route("/mcp/design/get-code", post(handle_stitch_get_code))
         .route("/mcp/spec/extract", post(handle_spec_extract))
         .route("/mcp/codegen/run", post(handle_codegen_run))
         .route("/mcp/repo/create-pr", post(handle_github_create_pr))
@@ -245,6 +247,28 @@ async fn handle_design_generate(
 ) -> Result<Json<ProviderProxyResponse>, (StatusCode, Json<ErrorResponse>)> {
     authorize_internal(&state, &headers)?;
     proxy_provider_call(&state, &state.banana, extract_payload(body)).await
+}
+
+async fn handle_stitch_generate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ProxyBody>,
+) -> Result<Json<ProviderProxyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_internal(&state, &headers)?;
+    let payload = extract_payload(body);
+    let normalized = normalize_stitch_tool_call(&state.stitch, "generate_screen_from_text", payload);
+    proxy_provider_call(&state, &state.stitch, normalized).await
+}
+
+async fn handle_stitch_get_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ProxyBody>,
+) -> Result<Json<ProviderProxyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_internal(&state, &headers)?;
+    let payload = extract_payload(body);
+    let normalized = normalize_stitch_tool_call(&state.stitch, "get_screen_code", payload);
+    proxy_provider_call(&state, &state.stitch, normalized).await
 }
 
 async fn handle_spec_extract(
@@ -403,7 +427,14 @@ async fn proxy_provider_call(
     let payload = normalize_provider_payload(provider, &url, payload);
     let mut extra_headers: Vec<(String, String)> = Vec::new();
     let bearer_token = if let Some(header_name) = provider.api_key_header.as_ref() {
-        extra_headers.push((header_name.clone(), token));
+        let value = if header_name.to_lowercase() == "authorization"
+            && !token.to_lowercase().starts_with("bearer ")
+        {
+            format!("Bearer {}", token)
+        } else {
+            token
+        };
+        extra_headers.push((header_name.clone(), value));
         None
     } else {
         Some(token)
@@ -441,13 +472,29 @@ async fn call_with_retry(
         match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
-                let text = resp.text().await.unwrap_or_else(|_| "{}".to_string());
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
                 if status.is_success() {
+                    if content_type.starts_with("image/") {
+                        use base64::Engine as _;
+                        let bytes = resp.bytes().await.unwrap_or_default();
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        return Ok((attempt, serde_json::json!({
+                            "image_base64": b64,
+                            "content_type": content_type
+                        })));
+                    }
+                    let text = resp.text().await.unwrap_or_else(|_| "{}".to_string());
                     let raw = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|_| {
                         serde_json::json!({ "raw_text": text })
                     });
                     return Ok((attempt, raw));
                 }
+                let text = resp.text().await.unwrap_or_else(|_| "{}".to_string());
                 let retriable =
                     status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS;
                 let err = format!("upstream {}: {}", status.as_u16(), text);
@@ -510,26 +557,43 @@ fn normalize_provider_payload(
 
 fn normalize_banana_payload(url: &Url, payload: serde_json::Value) -> serde_json::Value {
     let url_text = url.as_str().to_ascii_lowercase();
-    if !url_text.contains("generativelanguage.googleapis.com")
-        || !url_text.contains(":generatecontent")
+
+    // HuggingFace Inference API: {"inputs": "prompt", "parameters": {"seed": N}}
+    if url_text.contains("huggingface.co") {
+        if payload.get("inputs").is_some() {
+            return payload;
+        }
+        let prompt = extract_prompt_text(&payload)
+            .unwrap_or_else(|| serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()));
+        let mut body = serde_json::json!({ "inputs": prompt });
+        let seed = payload.get("seed").and_then(|v| v.as_u64())
+            .or_else(|| payload.get("input").and_then(|i| i.get("seed")).and_then(|v| v.as_u64()));
+        if let Some(seed) = seed {
+            body["parameters"] = serde_json::json!({ "seed": seed });
+        }
+        return body;
+    }
+
+    // Google Generative Language API (Gemini)
+    if url_text.contains("generativelanguage.googleapis.com")
+        && url_text.contains(":generatecontent")
     {
-        return payload;
+        if payload.get("contents").is_some() {
+            return payload;
+        }
+        let prompt = extract_prompt_text(&payload)
+            .unwrap_or_else(|| serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()));
+        return serde_json::json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{ "text": prompt }]
+                }
+            ]
+        });
     }
-    if payload.get("contents").is_some() {
-        return payload;
-    }
-    let prompt = extract_prompt_text(&payload)
-        .unwrap_or_else(|| serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()));
-    serde_json::json!({
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    { "text": prompt }
-                ]
-            }
-        ]
-    })
+
+    payload
 }
 
 fn normalize_claude_payload(
@@ -538,24 +602,66 @@ fn normalize_claude_payload(
     payload: serde_json::Value,
 ) -> serde_json::Value {
     let url_text = url.as_str().to_ascii_lowercase();
-    if !url_text.contains("api.anthropic.com") || !url_text.contains("/v1/messages") {
-        return payload;
+
+    // OpenAI Chat Completions
+    if url_text.contains("api.openai.com") && url_text.contains("/v1/chat/completions") {
+        if payload.get("messages").is_some() && payload.get("model").is_some() {
+            return payload;
+        }
+        // Codegen: build from spec_output → generate real HTML
+        let spec_content = payload.pointer("/input/spec_output")
+            .or_else(|| payload.pointer("/input/codegen_output"));
+        if let Some(spec) = spec_content {
+            let spec_text = match spec {
+                serde_json::Value::String(s) => s.clone(),
+                other => serde_json::to_string_pretty(other).unwrap_or_default(),
+            };
+            // Also extract OpenAI response content if it's nested
+            let spec_str = if let Some(content) = spec.pointer("/choices/0/message/content")
+                .and_then(|v| v.as_str()) {
+                content.to_string()
+            } else {
+                spec_text
+            };
+            return serde_json::json!({
+                "model": provider.default_model.as_deref().unwrap_or("gpt-4o"),
+                "max_tokens": 8192,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are an expert frontend developer. Generate a complete, beautiful, production-ready single-page HTML application with inline CSS and JavaScript. Use a modern design with gradients, shadows, and smooth animations. Return ONLY the raw HTML code — no markdown, no code blocks, no explanation."
+                    },
+                    {
+                        "role": "user",
+                        "content": format!("Build a stunning landing page based on this UI spec:\n\n{}", spec_str)
+                    }
+                ]
+            });
+        }
+        let prompt = extract_prompt_text(&payload)
+            .unwrap_or_else(|| serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()));
+        return serde_json::json!({
+            "model": provider.default_model.as_deref().unwrap_or("gpt-4o"),
+            "max_tokens": provider.default_max_tokens.unwrap_or(4096),
+            "messages": [{ "role": "user", "content": prompt }]
+        });
     }
-    if payload.get("messages").is_some() && payload.get("model").is_some() {
-        return payload;
+
+    // Anthropic Messages API
+    if url_text.contains("api.anthropic.com") && url_text.contains("/v1/messages") {
+        if payload.get("messages").is_some() && payload.get("model").is_some() {
+            return payload;
+        }
+        let prompt = extract_prompt_text(&payload)
+            .unwrap_or_else(|| serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()));
+        return serde_json::json!({
+            "model": provider.default_model.as_deref().unwrap_or("claude-3-5-sonnet-latest"),
+            "max_tokens": provider.default_max_tokens.unwrap_or(1024),
+            "messages": [{ "role": "user", "content": prompt }]
+        });
     }
-    let prompt = extract_prompt_text(&payload)
-        .unwrap_or_else(|| serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()));
-    serde_json::json!({
-        "model": provider.default_model.as_deref().unwrap_or("claude-3-5-sonnet-latest"),
-        "max_tokens": provider.default_max_tokens.unwrap_or(1024),
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    })
+
+    payload
 }
 
 fn normalize_stitch_payload(
@@ -564,9 +670,126 @@ fn normalize_stitch_payload(
     payload: serde_json::Value,
 ) -> serde_json::Value {
     let url_text = url.as_str().to_ascii_lowercase();
-    if !url_text.ends_with("/mcp") {
-        return payload;
+
+    // OpenAI Chat Completions — fallback khi chưa có Stitch
+    if url_text.contains("api.openai.com") && url_text.contains("/v1/chat/completions") {
+        if payload.get("messages").is_some() && payload.get("model").is_some() {
+            return payload;
+        }
+        let image_b64 = payload.pointer("/input/design_output/image_base64")
+            .and_then(|v| v.as_str());
+        if let Some(b64) = image_b64 {
+            let content_type = payload.pointer("/input/design_output/content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/jpeg");
+            return serde_json::json!({
+                "model": provider.default_model.as_deref().unwrap_or("gpt-4o"),
+                "max_tokens": provider.default_max_tokens.unwrap_or(4096),
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{};base64,{}", content_type, b64) }
+                        },
+                        {
+                            "type": "text",
+                            "text": "Analyze this UI mockup image and extract a structured spec as JSON with fields: component_list, color_palette (hex values), layout_description, typography (font families, sizes), key_sections. Be detailed and precise."
+                        }
+                    ]
+                }]
+            });
+        }
+        let input = serde_json::to_string(&payload).unwrap_or_default();
+        return serde_json::json!({
+            "model": provider.default_model.as_deref().unwrap_or("gpt-4o"),
+            "max_tokens": provider.default_max_tokens.unwrap_or(4096),
+            "messages": [{
+                "role": "user",
+                "content": format!(
+                    "You are a UI spec extractor. Given this design output, extract a structured spec with: component list, color tokens, layout description, and typography. Output as JSON.\n\nDesign output:\n{}",
+                    input
+                )
+            }]
+        });
     }
+
+    // Stitch MCP (stitch.googleapis.com/mcp or proxy)
+    if url_text.contains("/mcp") {
+        if payload.get("jsonrpc").is_some() && payload.get("method").is_some() {
+            return payload;
+        }
+        let tool_name = provider.mcp_tool_name.as_deref().unwrap_or("extract_design_context");
+        // Extract screen_id and project_id from input if available
+        let arguments = if let Some(input) = payload.get("input") {
+            let mut args = serde_json::Map::new();
+            if let Some(project_id) = input.get("project_id").and_then(|v| v.as_str()) {
+                args.insert("project_id".to_string(), serde_json::json!(project_id));
+            }
+            if let Some(screen_id) = input.get("screen_id").and_then(|v| v.as_str()) {
+                args.insert("screen_id".to_string(), serde_json::json!(screen_id));
+            }
+            if let Some(prompt) = input.get("prompt").and_then(|v| v.as_str()) {
+                args.insert("prompt".to_string(), serde_json::json!(prompt));
+            }
+            if let Some(model_id) = input.get("model_id").and_then(|v| v.as_str()) {
+                args.insert("model_id".to_string(), serde_json::json!(model_id));
+            }
+            if let Some(device_type) = input.get("device_type").and_then(|v| v.as_str()) {
+                args.insert("device_type".to_string(), serde_json::json!(device_type));
+            }
+            if args.is_empty() {
+                input.clone()
+            } else {
+                serde_json::Value::Object(args)
+            }
+        } else {
+            payload
+        };
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|_| "1".to_string());
+        return serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments
+            }
+        });
+    }
+
+    // Gemini API fallback for spec extraction
+    if url_text.contains("generativelanguage.googleapis.com") {
+        let input_text = if let Some(input) = payload.get("input") {
+            serde_json::to_string_pretty(input).unwrap_or_default()
+        } else {
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        };
+        return serde_json::json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{
+                    "text": format!(
+                        "You are a UI spec extractor. Extract a structured Design DNA spec from this design output as JSON with fields: component_list, color_palette (Tailwind classes + hex), layout_description, typography (font families, sizes), key_sections.\n\nDesign output:\n{}",
+                        input_text
+                    )
+                }]
+            }]
+        });
+    }
+
+    payload
+}
+
+fn normalize_stitch_tool_call(
+    _provider: &ProviderProxyConfig,
+    tool_name: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    // If already a valid JSON-RPC request, pass through
     if payload.get("jsonrpc").is_some() && payload.get("method").is_some() {
         return payload;
     }
@@ -574,13 +797,19 @@ fn normalize_stitch_payload(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis().to_string())
         .unwrap_or_else(|_| "1".to_string());
+    // Extract arguments from input wrapper if present
+    let arguments = if let Some(input) = payload.get("input") {
+        input.clone()
+    } else {
+        payload
+    };
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "tools/call",
         "params": {
-            "name": provider.mcp_tool_name.as_deref().unwrap_or("extract_spec"),
-            "arguments": payload
+            "name": tool_name,
+            "arguments": arguments
         }
     })
 }

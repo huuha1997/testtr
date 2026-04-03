@@ -238,7 +238,13 @@ async fn process_job(db: &PgPool, state: &WorkerState, job: &QueueJob) -> anyhow
         .execute(db)
         .await?;
     let payload: serde_json::Value = serde_json::from_str(&job.payload_json).unwrap_or_default();
-    let pr_result = maybe_create_pull_request(state, job.run_id, &payload).await?;
+    let pr_result = match maybe_create_pull_request(state, job.run_id, &payload).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(run_id = %job.run_id, "PR creation failed (non-fatal): {}", e);
+            format!("skipped: {}", e)
+        }
+    };
     upsert_step(
         db,
         job.run_id,

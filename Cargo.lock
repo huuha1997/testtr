@@ -888,8 +888,10 @@ name = "console"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "contracts",
+ "image",
  "reqwest",
  "serde",
  "serde_json",
@@ -3051,6 +3053,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "dotenvy",
  "reqwest",
  "serde",

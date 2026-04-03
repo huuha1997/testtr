@@ -249,9 +249,49 @@ async fn select_stack(
         run_id,
         "stack_selection".to_string(),
         "completed".to_string(),
-        Some(payload.stack_id),
+        Some(payload.stack_id.clone()),
     )
     .await?;
+
+    // Fetch prompt and selected mockup_id, then kick off spec generation
+    let prompt_row = sqlx::query_as::<_, (String,)>("SELECT prompt FROM runs WHERE id = $1")
+        .bind(run_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mockup_row = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT detail FROM run_steps WHERE run_id = $1 AND step_key = 'mockup_selection'",
+    )
+    .bind(run_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let prompt = prompt_row.map(|r| r.0).unwrap_or_default();
+    let selected_mockup_id = mockup_row.and_then(|r| r.0).unwrap_or_else(|| "A".to_string());
+
+    let mut conn = state.redis.get_multiplexed_async_connection().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    enqueue(
+        &mut conn,
+        "q.spec",
+        &QueueJob {
+            job_id: Uuid::new_v4(),
+            run_id,
+            step: "spec_generation".to_string(),
+            attempt: 1,
+            payload_json: serde_json::json!({
+                "prompt": prompt,
+                "selected_mockup_id": selected_mockup_id,
+                "stack_id": payload.stack_id,
+                "source": "user_selection"
+            })
+            .to_string(),
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     Ok(Json(TransitionRunResponse { run }))
 }
 

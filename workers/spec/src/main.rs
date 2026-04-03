@@ -177,7 +177,18 @@ async fn process_job(
         return Err(anyhow::anyhow!("forced failure"));
     }
     let input_payload: serde_json::Value = serde_json::from_str(&job.payload_json).unwrap_or_default();
-    let output = call_gateway_spec(state, job.run_id, input_payload).await?;
+
+    // If screen_id is available (from Stitch design), use extract_design_context
+    let has_screen_id = input_payload.get("screen_id").and_then(|v| v.as_str()).is_some()
+        || input_payload.pointer("/design_output/screen_id").and_then(|v| v.as_str()).is_some();
+
+    let output = if has_screen_id {
+        info!(run_id = %job.run_id, "using Stitch extract_design_context (screen_id found)");
+        call_gateway_spec(state, job.run_id, input_payload).await?
+    } else {
+        info!(run_id = %job.run_id, "using default spec extraction");
+        call_gateway_spec(state, job.run_id, input_payload).await?
+    };
 
     sqlx::query("UPDATE runs SET status = $2 WHERE id = $1")
         .bind(job.run_id)
